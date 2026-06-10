@@ -7,11 +7,13 @@ void main() {
     String? configuredPath,
     Map<String, String> environment = const {},
     Set<String> existing = const {},
+    String? executablePath,
   }) =>
       locateSilo(
         configuredPath: configuredPath,
         environment: environment,
         fileExists: existing.contains,
+        executablePath: executablePath,
       );
 
   group('locateSilo', () {
@@ -126,6 +128,62 @@ void main() {
     test('without HOME the cargo bin candidate is omitted', () {
       expect(
         siloCandidates(environment: const {}),
+        ['/opt/homebrew/bin/silo', '/usr/local/bin/silo'],
+      );
+    });
+
+    test('workspace target builds above the executable are found', () {
+      // The development app bundle lives inside the repository, so walking
+      // up from the executable reaches the repository root and its target/
+      // directory.
+      const exe = '/repo/apps/silo_app/build/macos/Build/Products/Debug/'
+          'Silo.app/Contents/MacOS/Silo';
+      expect(
+        locate(
+          executablePath: exe,
+          existing: {'/repo/target/debug/silo'},
+        ),
+        '/repo/target/debug/silo',
+      );
+      // A release build is preferred over a debug build of the same root.
+      expect(
+        locate(
+          executablePath: exe,
+          existing: {'/repo/target/debug/silo', '/repo/target/release/silo'},
+        ),
+        '/repo/target/release/silo',
+      );
+      // Nearer ancestors win over the repository root.
+      expect(
+        locate(
+          executablePath: exe,
+          existing: {
+            '/repo/apps/silo_app/target/release/silo',
+            '/repo/target/release/silo',
+          },
+        ),
+        '/repo/apps/silo_app/target/release/silo',
+      );
+    });
+
+    test('PATH and SILO_BIN take precedence over workspace builds', () {
+      expect(
+        locate(
+          executablePath: '/repo/apps/app.app/Contents/MacOS/app',
+          environment: {'PATH': '/bin'},
+          existing: {'/bin/silo', '/repo/target/release/silo'},
+        ),
+        '/bin/silo',
+      );
+    });
+
+    test('relative or absent executable paths add no candidates', () {
+      expect(
+        siloCandidates(environment: const {}, executablePath: 'Silo'),
+        ['/opt/homebrew/bin/silo', '/usr/local/bin/silo'],
+      );
+      expect(
+        siloCandidates(environment: const {}, executablePath: null),
         ['/opt/homebrew/bin/silo', '/usr/local/bin/silo'],
       );
     });

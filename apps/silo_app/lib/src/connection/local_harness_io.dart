@@ -22,11 +22,13 @@ bool get localRunsSupported =>
 bool get canSpawnHarness => Platform.isMacOS;
 
 /// The first existing `silo` binary, probing [configuredPath], `SILO_BIN`,
-/// `PATH`, and the conventional install locations. Null when none exists.
+/// `PATH`, workspace `target/` builds above the running app bundle, and
+/// the conventional install locations. Null when none exists.
 String? resolveSiloBinary(String? configuredPath) => locateSilo(
       configuredPath: configuredPath,
       environment: Platform.environment,
       fileExists: siloBinaryExists,
+      executablePath: Platform.resolvedExecutable,
     );
 
 /// True when a file exists at [path].
