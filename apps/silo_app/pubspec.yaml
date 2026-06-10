@@ -1,0 +1,26 @@
+name: silo_app
+description: "Flutter client for llmdevsilo harnesses (desktop, mobile, web)."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.0-149.0.dev
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web_socket_channel: ^3.0.0
+  cryptography: ^2.7.0
+  flutter_secure_storage: ^9.2.0
+  file_selector: ^1.0.3
+  provider: ^6.1.2
+  crypto: ^3.0.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

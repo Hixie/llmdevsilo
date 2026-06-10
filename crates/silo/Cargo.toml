@@ -1,0 +1,27 @@
+[package]
+name = "silo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "silo"
+path = "src/main.rs"
+
+[dependencies]
+silo-core = { workspace = true }
+silo-harness = { workspace = true }
+silo-proxy = { workspace = true }
+silo-sandbox = { workspace = true }
+silo-workspace = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

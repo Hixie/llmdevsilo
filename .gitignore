@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Flutter / Dart
+apps/silo_app/.dart_tool/
+apps/silo_app/build/
+apps/silo_app/.flutter-plugins
+apps/silo_app/.flutter-plugins-dependencies
+apps/silo_app/ios/Pods/
+apps/silo_app/macos/Pods/
+apps/silo_app/.idea/
+
+# Local state
+.DS_Store

@@ -1,0 +1,26 @@
+[package]
+name = "silo-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "silo_helper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "silo-helper"
+path = "src/main.rs"
+
+[dependencies]
+silo-core = { workspace = true }
+
+base64 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
