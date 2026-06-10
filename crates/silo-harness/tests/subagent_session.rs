@@ -19,7 +19,11 @@ async fn subagent_result_feeds_the_parent_turn() {
             common::llm_turn(
                 Some("do it"),
                 Some("Delegating."),
-                &[("t1", "Agent", json!({"prompt": "sub work"}))],
+                &[(
+                    "t1",
+                    "Agent",
+                    json!({"prompt": "sub work", "name": "sub task"}),
+                )],
                 StopReason::ToolUse,
                 TokenDelta::default(),
             ),
@@ -70,8 +74,9 @@ async fn subagent_result_feeds_the_parent_turn() {
             EventPayload::AgentSpawned {
                 parent,
                 agent,
+                name,
                 prompt,
-            } => Some((parent.clone(), agent.clone(), prompt.clone())),
+            } => Some((parent.clone(), agent.clone(), name.clone(), prompt.clone())),
             _ => None,
         })
         .collect();
@@ -80,6 +85,7 @@ async fn subagent_result_feeds_the_parent_turn() {
         vec![(
             "agent-0".to_string(),
             "agent-1".to_string(),
+            Some("sub task".to_string()),
             "sub work".to_string()
         )]
     );

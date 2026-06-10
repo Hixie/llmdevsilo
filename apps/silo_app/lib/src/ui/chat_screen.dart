@@ -9,6 +9,7 @@ import '../connection/harness_connection.dart';
 import '../protocol/event.dart';
 import 'access_sheet.dart';
 import 'chat_view.dart';
+import 'connection_details_sheet.dart';
 import 'pairing_info.dart';
 import 'pairing_sheet.dart';
 import 'theme.dart';
@@ -31,9 +32,18 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    connection.connect();
     connection.store.addListener(_onEvents);
-    connection.markRead();
+    // Connecting (and marking read) notifies the connection's listeners
+    // synchronously, and other widgets — such as the home screen tile for
+    // this harness — may be mid-build when this screen is inserted, so
+    // both wait for the end of the first frame.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      connection.connect();
+      connection.markRead();
+    });
   }
 
   @override
@@ -97,6 +107,31 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Future<void> _showConnectionDetails() async {
+    final fingerprint = await connection.pinnedFingerprint();
+    if (!mounted) {
+      return;
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (sheetContext) => ListenableBuilder(
+        listenable: connection,
+        builder: (context, _) => ConnectionDetailsSheet(
+          harnessId: connection.harnessId ?? connection.endpoint.harnessId,
+          url: connection.endpoint.url,
+          fingerprint: fingerprint,
+          clientId: connection.clientId,
+          protocolVersion: connection.protocolVersion,
+          showRawPayloads: connection.showRawPayloads,
+          onShowRawPayloadsChanged: (value) =>
+              connection.showRawPayloads = value,
+        ),
+      ),
+    );
+  }
+
   Future<void> _confirmShutdown() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -121,14 +156,25 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  /// Status line for the reconnecting state: the attempt number out of
+  /// the automatic cap, with a countdown to the next try.
+  String _reconnectLabel() {
+    final attempt = connection.reconnectAttempt;
+    final wait = connection.nextRetryIn;
+    final countdown =
+        wait == null ? '' : ', retrying in ${wait.inSeconds + 1}s';
+    return 'reconnecting (attempt $attempt of '
+        '${connection.maxAutoReconnects}$countdown)';
+  }
+
   Widget _statusChip(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final (color, label) = switch (connection.status) {
       ConnectionStatus.connected => (Colors.green, 'connected'),
       ConnectionStatus.connecting => (Colors.orange, 'connecting'),
       ConnectionStatus.authenticating => (Colors.orange, 'authenticating'),
-      ConnectionStatus.reconnecting => (Colors.orange, 'reconnecting'),
-      ConnectionStatus.failed => (scheme.error, 'auth failed'),
+      ConnectionStatus.reconnecting => (Colors.orange, _reconnectLabel()),
+      ConnectionStatus.failed => (scheme.error, 'connection failed'),
       ConnectionStatus.disconnected => (scheme.outline, 'offline'),
     };
     return Row(
@@ -136,7 +182,14 @@ class _ChatScreenState extends State<ChatScreen> {
       children: [
         Icon(Icons.circle, size: 10, color: color),
         const SizedBox(width: 6),
-        Text(label, style: Theme.of(context).textTheme.labelSmall),
+        Flexible(
+          child: Text(
+            label,
+            style: Theme.of(context).textTheme.labelSmall,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
       ],
     );
   }
@@ -267,7 +320,7 @@ class _ChatScreenState extends State<ChatScreen> {
             title: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(connection.endpoint.name,
+                Text(connection.displayName,
                     style: Theme.of(context).textTheme.titleMedium),
                 _statusChip(context),
               ],
@@ -287,6 +340,8 @@ class _ChatScreenState extends State<ChatScreen> {
                   switch (value) {
                     case 'pair':
                       _showPairingSheet();
+                    case 'details':
+                      _showConnectionDetails();
                     case 'shutdown':
                       _confirmShutdown();
                   }
@@ -297,6 +352,13 @@ class _ChatScreenState extends State<ChatScreen> {
                     child: ListTile(
                       leading: Icon(Icons.qr_code_2),
                       title: Text('Pair another device'),
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'details',
+                    child: ListTile(
+                      leading: Icon(Icons.info_outline),
+                      title: Text('Connection details'),
                     ),
                   ),
                   PopupMenuItem(
@@ -351,8 +413,12 @@ class _ChatScreenState extends State<ChatScreen> {
                 child: ChatView(
                   store: connection.store,
                   onAnswer: connection.answerQuestion,
+                  selfClientId: connection.clientId,
+                  showRawPayloads: connection.showRawPayloads,
                 ),
               ),
+              if (connection.store.isBusy)
+                const LinearProgressIndicator(minHeight: 2),
               _inputBar(context),
             ],
           ),
@@ -365,47 +431,77 @@ class _ChatScreenState extends State<ChatScreen> {
     final scheme = Theme.of(context).colorScheme;
     final awaiting = connection.store.events.isNotEmpty &&
         connection.store.events.last.payload is AwaitingInputPayload;
+    final busy = connection.store.isBusy;
     return SafeArea(
       child: Container(
-        padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+        padding: const EdgeInsets.fromLTRB(contentGutter, 6, 8, 8),
         decoration: BoxDecoration(
           color: scheme.surfaceContainerLow,
           border: Border(top: BorderSide(color: scheme.outlineVariant)),
         ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            IconButton(
-              icon: const Icon(Icons.attach_file),
-              tooltip: 'Upload file',
-              onPressed: _attachFile,
-            ),
-            Expanded(
-              child: TextField(
-                controller: _input,
-                focusNode: _inputFocus,
-                minLines: 1,
-                maxLines: 6,
-                textInputAction: TextInputAction.send,
-                onSubmitted: (_) => _sendPrompt(),
-                decoration: InputDecoration(
-                  hintText: awaiting
-                      ? 'The model is waiting for you…'
-                      : 'Message the harness',
-                  border: const OutlineInputBorder(
-                    borderRadius: BorderRadius.all(Radius.circular(24)),
-                  ),
-                  isDense: true,
-                  contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 16, vertical: 10),
+            if (busy)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(0, 0, 8, 4),
+                child: Text(
+                  'working…',
+                  style: Theme.of(context)
+                      .textTheme
+                      .labelSmall
+                      ?.copyWith(color: scheme.outline),
                 ),
               ),
-            ),
-            const SizedBox(width: 6),
-            IconButton.filled(
-              icon: const Icon(Icons.arrow_upward),
-              tooltip: 'Send',
-              onPressed: _sendPrompt,
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _input,
+                    focusNode: _inputFocus,
+                    minLines: 1,
+                    maxLines: 6,
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: (_) => _sendPrompt(),
+                    decoration: InputDecoration(
+                      hintText: awaiting
+                          ? 'The model is waiting for you…'
+                          : 'Message the harness',
+                      border: const OutlineInputBorder(
+                        borderRadius: BorderRadius.all(Radius.circular(24)),
+                      ),
+                      isDense: true,
+                      contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 10),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                IconButton(
+                  icon: const Icon(Icons.attach_file),
+                  tooltip: 'Upload file',
+                  onPressed: _attachFile,
+                ),
+                if (busy) ...[
+                  IconButton.filled(
+                    icon: const Icon(Icons.stop),
+                    tooltip: 'Stop',
+                    style: IconButton.styleFrom(
+                      backgroundColor: scheme.errorContainer,
+                      foregroundColor: scheme.onErrorContainer,
+                    ),
+                    onPressed: connection.interrupt,
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                IconButton.filled(
+                  icon: const Icon(Icons.arrow_upward),
+                  tooltip: 'Send',
+                  onPressed: _sendPrompt,
+                ),
+              ],
             ),
           ],
         ),

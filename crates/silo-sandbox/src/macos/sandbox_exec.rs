@@ -266,6 +266,15 @@ impl Sandbox for SandboxExecBackend {
         toolimpl::run_tool(&running.session, &running.workspace, &running.scratch, call).await
     }
 
+    /// Cancels in-flight helper executions so blocked `run_tool` calls
+    /// return with their partial output.
+    async fn interrupt(&self) -> Result<(), SandboxError> {
+        if let Some(running) = &self.running {
+            running.session.cancel_inflight().await;
+        }
+        Ok(())
+    }
+
     fn access_report(&self) -> AccessReport {
         let (workspace_mount, scratch_dir) = match &self.running {
             Some(running) => (

@@ -15,7 +15,15 @@ bool siloBinaryExists(String path) => false;
 
 String stateDir() => '';
 
-Future<List<RunInfo>> listLocalRuns() async => [];
+typedef PidProbe = Future<bool> Function(int pid);
+
+Future<bool> pidIsAlive(int pid) async => false;
+
+Future<List<RunInfo>> listLocalRuns({
+  PidProbe? isAlive,
+  String? runDir,
+}) async =>
+    [];
 
 Future<String> readLocalToken(RunInfo info) async =>
     throw UnsupportedError('local harnesses are not available on the web');

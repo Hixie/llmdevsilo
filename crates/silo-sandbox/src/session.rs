@@ -7,7 +7,7 @@
 //! of requests can be in flight at once and responses may arrive out of
 //! order.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,9 @@ fn closed_error() -> SandboxError {
 pub struct HelperSession {
     requests: mpsc::Sender<HelperRequest>,
     pending: Pending,
+    /// Ids of `Exec` requests currently awaiting a response, for
+    /// cancellation.
+    inflight_execs: Arc<Mutex<HashSet<u64>>>,
     next_id: AtomicU64,
     helper_version: String,
     helper_pid: u32,
@@ -91,6 +94,7 @@ impl HelperSession {
         let mut session = HelperSession {
             requests,
             pending,
+            inflight_execs: Arc::new(Mutex::new(HashSet::new())),
             next_id: AtomicU64::new(0),
             helper_version: String::new(),
             helper_pid: 0,
@@ -116,6 +120,7 @@ impl HelperSession {
     /// [`SandboxError::Unavailable`].
     pub async fn request(&self, op: HelperOp) -> Result<HelperPayload, SandboxError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let is_exec = matches!(op, HelperOp::Exec { .. });
         let (waiter_tx, waiter_rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().expect("pending request map poisoned");
@@ -126,6 +131,21 @@ impl HelperSession {
                 None => return Err(closed_error()),
             }
         }
+        if is_exec {
+            self.inflight_execs
+                .lock()
+                .expect("inflight exec set poisoned")
+                .insert(id);
+        }
+        let unregister_exec = |session: &HelperSession| {
+            if is_exec {
+                session
+                    .inflight_execs
+                    .lock()
+                    .expect("inflight exec set poisoned")
+                    .remove(&id);
+            }
+        };
         if self.requests.send(HelperRequest { id, op }).await.is_err() {
             if let Some(map) = self
                 .pending
@@ -135,11 +155,33 @@ impl HelperSession {
             {
                 map.remove(&id);
             }
+            unregister_exec(self);
             return Err(closed_error());
         }
-        match waiter_rx.await {
+        let result = match waiter_rx.await {
             Ok(result) => result,
             Err(_) => Err(closed_error()),
+        };
+        unregister_exec(self);
+        result
+    }
+
+    /// Sends a `Cancel` for every in-flight `Exec` request. The cancelled
+    /// executions respond promptly with their partial output and the
+    /// `cancelled` flag set; the blocked `request` callers return normally.
+    /// Only `Exec` is cancellable: every other operation completes quickly
+    /// on its own. Per-id failures (the execution finished before the
+    /// cancel arrived — a benign race) are ignored.
+    pub async fn cancel_inflight(&self) {
+        let ids: Vec<u64> = self
+            .inflight_execs
+            .lock()
+            .expect("inflight exec set poisoned")
+            .iter()
+            .copied()
+            .collect();
+        for id in ids {
+            let _ = self.request(HelperOp::Cancel { id }).await;
         }
     }
 
@@ -398,6 +440,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::Unavailable(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn cancel_inflight_ends_a_running_exec() {
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let _ = silo_helper::serve_stream_with_config(
+                server_side,
+                silo_helper::FetchConfig::default(),
+            )
+            .await;
+        });
+        let session = Arc::new(HelperSession::from_stream(client_side).await.unwrap());
+
+        let exec_session = session.clone();
+        let exec_task = tokio::spawn(async move {
+            exec_session
+                .request(HelperOp::Exec {
+                    command: "sleep 30".into(),
+                    cwd: None,
+                    env: vec![],
+                    timeout_ms: 120_000,
+                })
+                .await
+        });
+        // Wait until the exec is tracked as in flight before cancelling.
+        while session.inflight_execs.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        session.cancel_inflight().await;
+        let payload = tokio::time::timeout(Duration::from_secs(10), exec_task)
+            .await
+            .expect("exec did not return promptly after cancel")
+            .unwrap()
+            .unwrap();
+        match payload {
+            HelperPayload::Exec {
+                exit_code,
+                cancelled,
+                ..
+            } => {
+                assert_eq!(exit_code, -1);
+                assert!(cancelled);
+            }
+            other => panic!("expected Exec payload, got {other:?}"),
+        }
+        assert!(session.inflight_execs.lock().unwrap().is_empty());
     }
 
     #[cfg(unix)]

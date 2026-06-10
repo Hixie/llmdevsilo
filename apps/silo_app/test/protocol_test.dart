@@ -54,6 +54,29 @@ void main() {
       expect(event.toJson(), equals(fixture));
     });
 
+    test('user_prompt with client_name', () {
+      final fixture = eventFixture(1, {
+        'kind': 'user_prompt',
+        'client_id': 'client-1',
+        'client_name': "Ian's phone",
+        'text': 'hello',
+      });
+      expectEventRoundTrip(fixture);
+      final event = Event.fromJson(fixture);
+      expect((event.payload as UserPromptPayload).clientName, "Ian's phone");
+    });
+
+    test('user_prompt without client_name omits it on re-encode', () {
+      final fixture = eventFixture(1, {
+        'kind': 'user_prompt',
+        'client_id': 'client-1',
+        'text': 'hello',
+      });
+      final event = Event.fromJson(fixture);
+      expect((event.payload as UserPromptPayload).clientName, isNull);
+      expect(event.toJson(), equals(fixture));
+    });
+
     test('assistant_text', () {
       final fixture = eventFixture(2, {
         'kind': 'assistant_text',
@@ -99,6 +122,22 @@ void main() {
         'prompt': 'investigate the tests',
       });
       expectEventRoundTrip(fixture);
+      // Re-encoding omits the absent name, matching serde.
+      final event = Event.fromJson(fixture);
+      expect((event.payload as AgentSpawnedPayload).name, isNull);
+    });
+
+    test('agent_spawned with name', () {
+      final fixture = eventFixture(5, {
+        'kind': 'agent_spawned',
+        'parent': 'agent-0',
+        'agent': 'agent-1',
+        'name': 'refactor tests',
+        'prompt': 'investigate the tests',
+      });
+      expectEventRoundTrip(fixture);
+      final event = Event.fromJson(fixture);
+      expect((event.payload as AgentSpawnedPayload).name, 'refactor tests');
     });
 
     test('agent_completed', () {
@@ -236,6 +275,18 @@ void main() {
     test('awaiting_input (unit variant)', () {
       final fixture = eventFixture(13, {'kind': 'awaiting_input'});
       expectEventRoundTrip(fixture);
+    });
+
+    test('interrupted', () {
+      final fixture = eventFixture(13, {
+        'kind': 'interrupted',
+        'agent': 'agent-0',
+      });
+      expectEventRoundTrip(fixture);
+      final event = Event.fromJson(fixture);
+      expect(event.payload, isA<InterruptedPayload>());
+      expect((event.payload as InterruptedPayload).agent, 'agent-0');
+      expect(event.payload.kind, 'interrupted');
     });
 
     test('access_report_updated', () {
@@ -378,6 +429,7 @@ void main() {
       roundTrip(const RequestCostMessage(), {'type': 'request_cost'});
       roundTrip(const RequestPairingCodeMessage(),
           {'type': 'request_pairing_code'});
+      roundTrip(const InterruptMessage(), {'type': 'interrupt'});
       roundTrip(const ShutdownMessage(), {'type': 'shutdown'});
     });
 

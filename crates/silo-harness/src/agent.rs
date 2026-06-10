@@ -13,10 +13,10 @@ use silo_core::conversation::{
 use silo_core::error::{FrontendError, HarnessError};
 use silo_core::event::{EventBus, EventPayload};
 use silo_core::journal::{JournalEntry, JournalHandle};
-use silo_core::tool::{ToolCall, ToolOutput, ToolOwner, ToolRegistry};
+use silo_core::tool::{ToolCall, ToolOutput, ToolOwner, ToolRegistry, INTERRUPTED_BY_USER};
 use silo_core::traits::{Frontend, LlmBackend, Sandbox};
 
-use crate::shutdown::ShutdownSignal;
+use crate::shutdown::{AbortReason, ShutdownSignal};
 
 /// Maximum subagent nesting depth. The top-level agent is depth 0.
 const MAX_SUBAGENT_DEPTH: u32 = 3;
@@ -48,6 +48,9 @@ pub(crate) enum TurnOutcome {
     Completed { final_text: String },
     /// A shutdown was requested mid-turn.
     ShutdownRequested,
+    /// The user interrupted the turn. The conversation already carries a
+    /// tool result for every tool use of its last assistant message.
+    Interrupted,
     /// The LLM request failed; an Error event has been emitted. The message
     /// is the error's display form.
     LlmFailed(String),
@@ -59,23 +62,37 @@ enum ToolDisposition {
         output: ToolOutput,
     },
     Shutdown,
+    /// The tool call was ended by an interrupt without producing a result;
+    /// the caller records a synthetic interrupted result for it.
+    Interrupted,
 }
 
 /// Runs the conversation until the model stops calling tools, an LLM error
-/// occurs, or a shutdown is requested. Tool calls within one response run
-/// sequentially in order; the Agent tool recurses into this function for
-/// the subagent and awaits it inline.
+/// occurs, a shutdown is requested, or the user interrupts. Tool calls
+/// within one response run sequentially in order; the Agent tool recurses
+/// into this function for the subagent and awaits it inline.
+///
+/// `turn_generation` is the interrupt generation snapshotted when the
+/// top-level turn started; an interrupt applies to this turn when the
+/// generation grows past it. Interrupt checkpoints: before each LLM call,
+/// during each LLM call (the in-flight completion is dropped and the
+/// conversation keeps no trace of it), and before each tool call (the
+/// remaining tool uses get synthetic interrupted results).
 pub(crate) fn drive<'c>(
     ctx: &'c SessionCtx<'c>,
     agent: AgentId,
     kind: AgentKind,
     messages: &'c mut Vec<Message>,
     depth: u32,
+    turn_generation: u64,
 ) -> BoxFuture<'c, Result<TurnOutcome, HarnessError>> {
     Box::pin(async move {
         loop {
             if ctx.shutdown.check().await.is_some() {
                 return Ok(TurnOutcome::ShutdownRequested);
+            }
+            if ctx.shutdown.interrupted_since(turn_generation) {
+                return Ok(TurnOutcome::Interrupted);
             }
             let request = CompletionRequest {
                 system: ctx.system.to_string(),
@@ -88,7 +105,22 @@ pub(crate) fn drive<'c>(
                 backend: ctx.backend.id(),
                 request: request.clone(),
             });
-            let response = match ctx.backend.complete(&request).await {
+            let completion = tokio::select! {
+                biased;
+                abort = ctx.shutdown.wait_abort(turn_generation) => {
+                    return Ok(match abort {
+                        AbortReason::Shutdown(_) => TurnOutcome::ShutdownRequested,
+                        AbortReason::Interrupted => {
+                            ctx.journal.append(JournalEntry::Lifecycle {
+                                message: format!("{agent}: llm call aborted by interrupt"),
+                            });
+                            TurnOutcome::Interrupted
+                        }
+                    });
+                }
+                completion = ctx.backend.complete(&request) => completion,
+            };
+            let response = match completion {
                 Ok(response) => response,
                 Err(error) => {
                     let message = error.to_string();
@@ -140,15 +172,20 @@ pub(crate) fn drive<'c>(
             }
 
             let mut result_blocks = Vec::with_capacity(tool_calls.len());
+            let mut interrupted = false;
             for call in &tool_calls {
                 if ctx.shutdown.check().await.is_some() {
                     return Ok(TurnOutcome::ShutdownRequested);
+                }
+                if ctx.shutdown.interrupted_since(turn_generation) {
+                    interrupted = true;
+                    break;
                 }
                 ctx.bus.emit(EventPayload::ToolUse {
                     agent: agent.clone(),
                     call: call.clone(),
                 });
-                let output = match execute_tool(ctx, &agent, call, depth).await? {
+                match execute_tool(ctx, &agent, call, depth, turn_generation).await? {
                     ToolDisposition::Output { owner, output } => {
                         ctx.journal.append(JournalEntry::ToolExec {
                             agent: agent.clone(),
@@ -162,15 +199,40 @@ pub(crate) fn drive<'c>(
                             tool_name: call.name.clone(),
                             output: output.clone(),
                         });
-                        output
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: call.id.clone(),
+                            content: output.content,
+                            is_error: output.is_error,
+                        });
                     }
                     ToolDisposition::Shutdown => return Ok(TurnOutcome::ShutdownRequested),
-                };
-                result_blocks.push(ContentBlock::ToolResult {
-                    tool_use_id: call.id.clone(),
-                    content: output.content,
-                    is_error: output.is_error,
+                    ToolDisposition::Interrupted => {
+                        interrupted = true;
+                        break;
+                    }
+                }
+            }
+            if interrupted {
+                // Cancelled tool calls were never executed, so they get no
+                // ToolExec journal entry and no ToolResult event; the
+                // synthetic results below keep the conversation well-formed
+                // for the next LLM request.
+                let cancelled = tool_calls.len() - result_blocks.len();
+                ctx.journal.append(JournalEntry::Lifecycle {
+                    message: format!("{agent}: interrupt cancelled {cancelled} tool call(s)"),
                 });
+                for call in &tool_calls[result_blocks.len()..] {
+                    result_blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content: INTERRUPTED_BY_USER.into(),
+                        is_error: true,
+                    });
+                }
+                messages.push(Message {
+                    role: Role::User,
+                    content: result_blocks,
+                });
+                return Ok(TurnOutcome::Interrupted);
             }
             messages.push(Message {
                 role: Role::User,
@@ -211,23 +273,12 @@ async fn execute_tool(
     agent: &AgentId,
     call: &ToolCall,
     depth: u32,
+    turn_generation: u64,
 ) -> Result<ToolDisposition, HarnessError> {
     match ctx.registry.owner_of(&call.name) {
-        Some(ToolOwner::Sandbox) => match ctx.sandbox.run_tool(agent, call).await {
-            Ok(output) => Ok(ToolDisposition::Output {
-                owner: "sandbox",
-                output,
-            }),
-            Err(error) => {
-                ctx.bus.emit(EventPayload::Error {
-                    context: format!("sandbox tool {}", call.name),
-                    message: error.to_string(),
-                });
-                Err(error.into())
-            }
-        },
-        Some(ToolOwner::Frontend) => run_frontend_tool(ctx, agent, call).await,
-        Some(ToolOwner::Harness) => run_agent_tool(ctx, agent, call, depth).await,
+        Some(ToolOwner::Sandbox) => run_sandbox_tool(ctx, agent, call, turn_generation).await,
+        Some(ToolOwner::Frontend) => run_frontend_tool(ctx, agent, call, turn_generation).await,
+        Some(ToolOwner::Harness) => run_agent_tool(ctx, agent, call, depth, turn_generation).await,
         None => Ok(ToolDisposition::Output {
             owner: "harness",
             output: ToolOutput::error(format!("unknown tool: {}", call.name)),
@@ -235,13 +286,66 @@ async fn execute_tool(
     }
 }
 
+/// Runs a sandbox tool against the abort signal. A shutdown drops the
+/// in-flight execution. An interrupt cancels it through
+/// `Sandbox::interrupt` and then awaits the original future — the helper
+/// answers promptly once the child process dies — so the partial
+/// stdout/stderr becomes the tool result and stays in the conversation;
+/// the turn is marked interrupted at the loop's next checkpoint.
+async fn run_sandbox_tool(
+    ctx: &SessionCtx<'_>,
+    agent: &AgentId,
+    call: &ToolCall,
+    turn_generation: u64,
+) -> Result<ToolDisposition, HarnessError> {
+    let result = {
+        let tool_future = ctx.sandbox.run_tool(agent, call);
+        tokio::pin!(tool_future);
+        tokio::select! {
+            biased;
+            result = &mut tool_future => result,
+            abort = ctx.shutdown.wait_abort(turn_generation) => match abort {
+                AbortReason::Shutdown(_) => return Ok(ToolDisposition::Shutdown),
+                AbortReason::Interrupted => {
+                    if let Err(error) = ctx.sandbox.interrupt().await {
+                        ctx.bus.emit(EventPayload::Error {
+                            context: "sandbox interrupt".into(),
+                            message: error.to_string(),
+                        });
+                    }
+                    tool_future.await
+                }
+            },
+        }
+    };
+    match result {
+        Ok(output) => Ok(ToolDisposition::Output {
+            owner: "sandbox",
+            output,
+        }),
+        Err(error) => {
+            ctx.bus.emit(EventPayload::Error {
+                context: format!("sandbox tool {}", call.name),
+                message: error.to_string(),
+            });
+            Err(error.into())
+        }
+    }
+}
+
 /// Runs a frontend-owned tool. For SendUserFile the file is first read
 /// through the sandbox Read path and the content (base64) is injected into
 /// the forwarded call input as `content_b64`.
+///
+/// The tool runs against the abort signal: a shutdown drops it, and an
+/// interrupt cancels the frontend's pending interaction
+/// (`Frontend::interrupt`) and then records the resolved output as the tool
+/// result.
 async fn run_frontend_tool(
     ctx: &SessionCtx<'_>,
     agent: &AgentId,
     call: &ToolCall,
+    turn_generation: u64,
 ) -> Result<ToolDisposition, HarnessError> {
     let mut forwarded = call.clone();
     if call.name == "SendUserFile" {
@@ -282,7 +386,29 @@ async fn run_frontend_tool(
             }
         }
     }
-    match ctx.frontend.run_tool(agent, &forwarded).await {
+    let result = {
+        let tool_future = ctx.frontend.run_tool(agent, &forwarded);
+        tokio::pin!(tool_future);
+        // The tool future is polled first so the frontend registers the
+        // interaction (the pending question) before any abort handling.
+        tokio::select! {
+            biased;
+            result = &mut tool_future => result,
+            abort = ctx.shutdown.wait_abort(turn_generation) => match abort {
+                AbortReason::Shutdown(_) => return Ok(ToolDisposition::Shutdown),
+                AbortReason::Interrupted => {
+                    if let Err(error) = ctx.frontend.interrupt().await {
+                        ctx.bus.emit(EventPayload::Error {
+                            context: "frontend interrupt".into(),
+                            message: error.to_string(),
+                        });
+                    }
+                    tool_future.await
+                }
+            },
+        }
+    };
+    match result {
         Ok(output) => Ok(ToolDisposition::Output {
             owner: "frontend",
             output,
@@ -307,6 +433,7 @@ async fn run_agent_tool(
     agent: &AgentId,
     call: &ToolCall,
     depth: u32,
+    turn_generation: u64,
 ) -> Result<ToolDisposition, HarnessError> {
     let prompt = match call.input.get("prompt").and_then(|value| value.as_str()) {
         Some(prompt) if !prompt.is_empty() => prompt.to_string(),
@@ -336,10 +463,17 @@ async fn run_agent_tool(
             })
         }
     };
+    let name = call
+        .input
+        .get("name")
+        .and_then(|value| value.as_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
     let sub_id: AgentId = format!("agent-{}", ctx.agent_counter.fetch_add(1, Ordering::SeqCst));
     ctx.bus.emit(EventPayload::AgentSpawned {
         parent: agent.clone(),
         agent: sub_id.clone(),
+        name,
         prompt: prompt.clone(),
     });
     let mut sub_messages = vec![Message::user_text(prompt)];
@@ -349,6 +483,7 @@ async fn run_agent_tool(
         AgentKind::Subagent,
         &mut sub_messages,
         depth + 1,
+        turn_generation,
     )
     .await?;
     drop(permit);
@@ -375,6 +510,16 @@ async fn run_agent_tool(
                 output: ToolOutput::error(message),
             })
         }
+        TurnOutcome::Interrupted => {
+            // The parent loop records the synthetic interrupted result for
+            // this Agent tool use and unwinds.
+            ctx.bus.emit(EventPayload::AgentCompleted {
+                agent: sub_id,
+                result: "interrupted by the user".into(),
+                is_error: true,
+            });
+            Ok(ToolDisposition::Interrupted)
+        }
         TurnOutcome::ShutdownRequested => {
             ctx.bus.emit(EventPayload::AgentCompleted {
                 agent: sub_id,
@@ -384,6 +529,22 @@ async fn run_agent_tool(
             Ok(ToolDisposition::Shutdown)
         }
     }
+}
+
+/// Appends a user prompt to the conversation. When the conversation
+/// already ends with a user message — tool results from an interrupted
+/// turn, or an earlier prompt whose turn was interrupted before any
+/// assistant message — the prompt is added to that message as a text
+/// block, so strict-alternation backends never see two consecutive user
+/// messages. Otherwise it becomes a new user message.
+fn push_user_prompt(messages: &mut Vec<Message>, text: String) {
+    if let Some(last) = messages.last_mut() {
+        if last.role == Role::User {
+            last.content.push(ContentBlock::Text { text });
+            return;
+        }
+    }
+    messages.push(Message::user_text(text));
 }
 
 /// The top-level loop: emits AwaitingInput, waits for the next user input
@@ -411,6 +572,14 @@ pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<Option<String
         };
         match input {
             Ok(text) => {
+                // Commands sent while the harness was idle are applied
+                // before the generation snapshot below, so a pre-turn
+                // interrupt is consumed here and does not abort the new
+                // turn.
+                if let Some(message) = ctx.shutdown.check().await {
+                    return Ok(message);
+                }
+                let turn_generation = ctx.shutdown.interrupt_generation();
                 // The interactive frontend emits UserPrompt itself when a
                 // client sends a prompt, so all clients see it immediately,
                 // even mid-turn. For every other frontend kind the harness
@@ -418,12 +587,35 @@ pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<Option<String
                 if ctx.frontend.kind() != "interactive" {
                     ctx.bus.emit(EventPayload::UserPrompt {
                         client_id: None,
+                        client_name: None,
                         text: text.clone(),
                     });
                 }
-                messages.push(Message::user_text(text));
-                match drive(ctx, agent.clone(), AgentKind::TopLevel, &mut messages, 0).await? {
+                push_user_prompt(&mut messages, text);
+                match drive(
+                    ctx,
+                    agent.clone(),
+                    AgentKind::TopLevel,
+                    &mut messages,
+                    0,
+                    turn_generation,
+                )
+                .await?
+                {
                     TurnOutcome::Completed { .. } => {
+                        consecutive_llm_failures = 0;
+                        continue;
+                    }
+                    TurnOutcome::Interrupted => {
+                        if let Err(error) = ctx.frontend.interrupt().await {
+                            ctx.bus.emit(EventPayload::Error {
+                                context: "frontend interrupt".into(),
+                                message: error.to_string(),
+                            });
+                        }
+                        ctx.bus.emit(EventPayload::Interrupted {
+                            agent: agent.clone(),
+                        });
                         consecutive_llm_failures = 0;
                         continue;
                     }
@@ -466,5 +658,81 @@ pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<Option<String
                 return Err(error.into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_merges_into_a_trailing_tool_result_message() {
+        let mut messages = vec![
+            Message::user_text("start"),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            }]),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "out".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        push_user_prompt(&mut messages, "carry on".into());
+        assert_eq!(messages.len(), 3);
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content.len(), 2);
+        assert!(matches!(
+            &last.content[1],
+            ContentBlock::Text { text } if text == "carry on"
+        ));
+    }
+
+    #[test]
+    fn prompt_merges_into_any_trailing_user_message() {
+        // An early interrupt can leave a plain user message (no tool
+        // results) at the end of the conversation; the next prompt must
+        // merge into it so user messages never appear back to back.
+        let mut messages = vec![Message::user_text("first prompt")];
+        push_user_prompt(&mut messages, "second prompt".into());
+        assert_eq!(messages.len(), 1);
+        let only = &messages[0];
+        assert_eq!(only.role, Role::User);
+        assert_eq!(only.content.len(), 2);
+        assert!(matches!(
+            &only.content[0],
+            ContentBlock::Text { text } if text == "first prompt"
+        ));
+        assert!(matches!(
+            &only.content[1],
+            ContentBlock::Text { text } if text == "second prompt"
+        ));
+    }
+
+    #[test]
+    fn prompt_after_an_assistant_message_starts_a_new_user_message() {
+        let mut messages = vec![
+            Message::user_text("hi"),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "hello".into(),
+            }]),
+        ];
+        push_user_prompt(&mut messages, "next".into());
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].role, Role::User);
+    }
+
+    #[test]
+    fn prompt_into_an_empty_conversation_is_a_user_message() {
+        let mut messages = Vec::new();
+        push_user_prompt(&mut messages, "go".into());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::User);
     }
 }

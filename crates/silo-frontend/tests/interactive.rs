@@ -145,9 +145,15 @@ async fn prompt_is_fanned_out_queued_and_emitted_once() {
     let event_b = await_event_kind(&mut b, "user_prompt").await;
     for event in [&event_a, &event_b] {
         match &event.payload {
-            EventPayload::UserPrompt { client_id, text } => {
+            EventPayload::UserPrompt {
+                client_id,
+                client_name,
+                text,
+            } => {
                 assert_eq!(text, "build the thing");
                 assert!(client_id.is_some());
+                // Local-token clients have no display name.
+                assert_eq!(client_name, &None);
             }
             other => panic!("expected user_prompt, got {other:?}"),
         }
@@ -282,6 +288,29 @@ async fn pairing_then_challenge_login_works_and_misuse_fails() {
         .await
         .unwrap();
     assert_eq!(login.key_id.as_deref(), Some(key_id.as_str()));
+
+    // Prompts from the paired client carry the name registered at pairing.
+    client::send_client(
+        &mut returning,
+        &ClientMessage::Prompt {
+            text: "from the laptop".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let prompt = await_event_kind(&mut local, "user_prompt").await;
+    match &prompt.payload {
+        EventPayload::UserPrompt {
+            client_id,
+            client_name,
+            text,
+        } => {
+            assert_eq!(text, "from the laptop");
+            assert!(client_id.is_some());
+            assert_eq!(client_name.as_deref(), Some("test laptop"));
+        }
+        other => panic!("expected user_prompt, got {other:?}"),
+    }
 
     // The pairing code is single use.
     let (mut reuse, _) = client::connect(&server.run.addr, &server.run.cert_fingerprint_sha256)
@@ -572,6 +601,77 @@ async fn upload_access_report_cost_and_send_user_file_flow() {
         }
         other => panic!("expected file_shared, got {other:?}"),
     }
+
+    server.frontend.shutdown(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn client_interrupt_forwards_a_frontend_command() {
+    let mut server = boot().await;
+    let (mut a, _) = connect_and_auth(&server).await;
+    client::send_client(&mut a, &ClientMessage::Interrupt)
+        .await
+        .unwrap();
+    assert_eq!(
+        server.commands_rx.recv().await.unwrap(),
+        FrontendCommand::Interrupt
+    );
+    server.frontend.shutdown(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn interrupt_resolves_a_pending_question_as_interrupted() {
+    let mut server = boot().await;
+    let (mut a, _) = connect_and_auth(&server).await;
+
+    let call = ToolCall {
+        id: "tool-use-1".into(),
+        name: "AskUserQuestion".into(),
+        input: json!({
+            "question": "Keep going?",
+            "options": [{"label": "yes"}, {"label": "no"}]
+        }),
+    };
+    let agent = "agent-0".to_string();
+    let frontend = &server.frontend;
+    let ask = frontend.run_tool(&agent, &call);
+
+    let drive_client = async {
+        let asked = await_event_kind(&mut a, "question_asked").await;
+        let question_id = match &asked.payload {
+            EventPayload::QuestionAsked { id, .. } => id.clone(),
+            other => panic!("expected question_asked, got {other:?}"),
+        };
+        frontend.interrupt().await.unwrap();
+        let answered = await_event_kind(&mut a, "question_answered").await;
+        match &answered.payload {
+            EventPayload::QuestionAnswered {
+                id,
+                client_id,
+                answer,
+            } => {
+                assert_eq!(id, &question_id);
+                assert!(client_id.is_none());
+                assert_eq!(answer, "[interrupted]");
+            }
+            other => panic!("expected question_answered, got {other:?}"),
+        }
+    };
+
+    let (tool_result, ()) = tokio::join!(ask, drive_client);
+    let output = tool_result.unwrap();
+    assert!(output.is_error);
+    assert_eq!(output.content, "[interrupted by the user]");
+
+    // With no pending question, a second interrupt resolves nothing.
+    server.frontend.interrupt().await.unwrap();
+    let answered_events = server
+        .bus
+        .since(0)
+        .into_iter()
+        .filter(|e| e.payload.kind() == "question_answered")
+        .count();
+    assert_eq!(answered_events, 1);
 
     server.frontend.shutdown(None).await.unwrap();
 }

@@ -11,6 +11,10 @@ const String monoFontFamily = 'JetBrains Mono';
 /// Seed color shared with the launcher icon background.
 const Color siloSeedColor = Color(0xFF356859);
 
+/// Shared left edge for transcript content (prompts, assistant text, tool
+/// tiles) and the input field below it.
+const double contentGutter = 16;
+
 /// Builds the app theme for [brightness]. Inter is the default family; the
 /// text theme uses medium-to-semibold titles, a slightly smaller body size,
 /// and near-zero letter spacing.

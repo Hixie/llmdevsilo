@@ -32,6 +32,28 @@ QuestionAskedPayload asked(
     );
 
 void main() {
+  testWidgets('the circled icon aligns with the top of the question text',
+      (tester) async {
+    await tester.pumpWidget(wrap(QuestionCard(
+      payload: asked('q-1', options: const [
+        QuestionOption(label: 'Yes'),
+        QuestionOption(label: 'No'),
+      ]),
+      onAnswer: (_) {},
+    )));
+
+    final circle = find
+        .ancestor(
+          of: find.byIcon(Icons.question_mark_rounded),
+          matching: find.byType(Container),
+        )
+        .first;
+    expect(
+      tester.getTopLeft(circle).dy,
+      tester.getTopLeft(find.text('Pick something')).dy,
+    );
+  });
+
   testWidgets('single select answers immediately on tap', (tester) async {
     String? answer;
     await tester.pumpWidget(wrap(QuestionCard(

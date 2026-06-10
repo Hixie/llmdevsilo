@@ -55,6 +55,11 @@ struct Args {
     /// One-time pairing code; generates and registers a new client key.
     #[arg(long, requires = "url")]
     pair: Option<String>,
+
+    /// Start with debug mode on: raw ids in the status bar, transcript,
+    /// and harness picker. Toggled at runtime with /debug.
+    #[arg(long)]
+    debug: bool,
 }
 
 enum Launch {
@@ -77,6 +82,7 @@ fn target_from_run_info(info: &RunInfo) -> anyhow::Result<Box<ConnectTarget>> {
         fingerprint: info.cert_fingerprint_sha256.clone(),
         auth: AuthSpec::LocalToken { token },
         persist_state_dir: None,
+        workspace: Some(info.workspace.clone()),
     }))
 }
 
@@ -139,6 +145,7 @@ fn resolve_remote(args: &Args, state_dir: &Path, url: &str) -> anyhow::Result<Bo
         fingerprint,
         auth,
         persist_state_dir: Some(state_dir.to_path_buf()),
+        workspace: None,
     }))
 }
 
@@ -203,8 +210,14 @@ fn setup_terminal() -> anyhow::Result<(Term, TerminalGuard)> {
 }
 
 /// Blocking selection screen shown when several local harnesses are
-/// running. Returns `None` when the user cancels.
-fn select_harness(terminal: &mut Term, harnesses: &[RunInfo]) -> anyhow::Result<Option<RunInfo>> {
+/// running. Harnesses are identified by their workspace folder name; the
+/// raw harness id is added in debug mode. Returns `None` when the user
+/// cancels.
+fn select_harness(
+    terminal: &mut Term,
+    harnesses: &[RunInfo],
+    debug: bool,
+) -> anyhow::Result<Option<RunInfo>> {
     use ratatui::layout::{Constraint, Layout};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::Line;
@@ -236,13 +249,12 @@ fn select_harness(terminal: &mut Term, harnesses: &[RunInfo]) -> anyhow::Result<
                     } else {
                         Style::new()
                     };
-                    Line::styled(
-                        format!(
-                            "{marker}{}  {}  {}",
-                            info.harness_id, info.addr, info.workspace
-                        ),
-                        style,
-                    )
+                    let name = crate::app::workspace_folder_name(&info.workspace);
+                    let mut line = format!("{marker}{name}  {}  {}", info.addr, info.workspace);
+                    if debug {
+                        line.push_str(&format!("  [{}]", info.harness_id));
+                    }
+                    Line::styled(line, style)
                 })
                 .collect();
             frame.render_widget(
@@ -334,7 +346,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let (mut terminal, guard) = setup_terminal()?;
     let target = match launch {
         Launch::Connect(target) => target,
-        Launch::Choose(harnesses) => match select_harness(&mut terminal, &harnesses)? {
+        Launch::Choose(harnesses) => match select_harness(&mut terminal, &harnesses, args.debug)? {
             Some(info) => target_from_run_info(&info)?,
             None => return Ok(()),
         },
@@ -342,9 +354,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     let mut app = App::new(
         target.addr.clone(),
-        target.addr.clone(),
         target.fingerprint.clone(),
+        target.workspace.clone(),
     );
+    app.debug = args.debug;
     let result = event_loop(&mut terminal, &mut app, *target).await;
     drop(guard);
     result?;

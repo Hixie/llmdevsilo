@@ -45,9 +45,45 @@ String stateDir() {
   return '$home/.llmdevsilo';
 }
 
-/// Run files of currently live local harnesses.
-Future<List<RunInfo>> listLocalRuns() async {
-  final dir = Directory('${stateDir()}/run');
+/// Probe for whether the process with a given pid is running.
+typedef PidProbe = Future<bool> Function(int pid);
+
+/// Runs an executable and returns its result; injectable for tests.
+typedef RunProcess = Future<ProcessResult> Function(
+    String executable, List<String> arguments);
+
+/// Sends signal 0 to [pid] (`kill -0`), which tests for existence without
+/// delivering anything. A failure whose stderr indicates a permission
+/// error counts as alive: the process exists but belongs to another user.
+/// Returns true on platforms without `kill` and on probe errors, so an
+/// unprobeable run file is shown rather than hidden.
+Future<bool> pidIsAlive(int pid, {RunProcess? runProcess}) async {
+  if (!Platform.isMacOS && !Platform.isLinux) {
+    return true;
+  }
+  final run = runProcess ?? Process.run;
+  try {
+    final result = await run('kill', ['-0', '$pid']);
+    if (result.exitCode == 0) {
+      return true;
+    }
+    final stderr = '${result.stderr}'.toLowerCase();
+    return stderr.contains('not permitted') || stderr.contains('eperm');
+  } catch (_) {
+    return true;
+  }
+}
+
+/// Run files of currently live local harnesses. Run files whose pid is no
+/// longer running are skipped but never deleted: the silo CLI owns
+/// pruning. [isAlive] defaults to [pidIsAlive]; [runDir] defaults to the
+/// `run` directory under [stateDir].
+Future<List<RunInfo>> listLocalRuns({
+  PidProbe? isAlive,
+  String? runDir,
+}) async {
+  final probe = isAlive ?? pidIsAlive;
+  final dir = Directory(runDir ?? '${stateDir()}/run');
   if (!await dir.exists()) {
     return [];
   }
@@ -59,7 +95,10 @@ Future<List<RunInfo>> listLocalRuns() async {
     try {
       final json =
           jsonDecode(await entry.readAsString()) as Map<String, dynamic>;
-      runs.add(RunInfo.fromJson(json));
+      final run = RunInfo.fromJson(json);
+      if (await probe(run.pid)) {
+        runs.add(run);
+      }
     } catch (_) {
       // A run file may be mid-write or stale; skip it.
     }

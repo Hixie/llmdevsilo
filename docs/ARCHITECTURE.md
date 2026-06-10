@@ -18,7 +18,7 @@ contracts between all other crates.
 | `silo-frontend` | Frontend implementations: interactive (TLS WebSocket server with auth), headless (Exit tool), mock (scripted). |
 | `silo-harness` | The orchestrator: agent loop, subagent spawning, tool routing, journaling, cost events, shutdown. |
 | `silo` | The CLI binary: `silo run`, `silo workspace lock/unlock/status`, `silo shell`, `silo replay-test`, `silo harnesses`. |
-| `silo-tui` | Interactive colorful terminal client app (connects to the interactive frontend over TLS WebSocket). |
+| `apps/silo-tui` | Interactive colorful terminal client app (connects to the interactive frontend over TLS WebSocket). A Cargo workspace member that lives under `apps/` with the other client applications. |
 | `apps/silo_app` | Flutter client (desktop, mobile, web). Multiple simultaneous harness connections; can spawn local harnesses on desktop. |
 
 Dependency rule: implementation crates (`silo-llm`, `silo-proxy`,

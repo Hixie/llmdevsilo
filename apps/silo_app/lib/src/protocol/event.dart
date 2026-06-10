@@ -130,6 +130,7 @@ sealed class EventPayload {
       case 'user_prompt':
         return UserPromptPayload(
           clientId: json['client_id'] as String?,
+          clientName: json['client_name'] as String?,
           text: json['text'] as String,
         );
       case 'assistant_text':
@@ -153,6 +154,7 @@ sealed class EventPayload {
         return AgentSpawnedPayload(
           parent: json['parent'] as String,
           agent: json['agent'] as String,
+          name: json['name'] as String?,
           prompt: json['prompt'] as String,
         );
       case 'agent_completed':
@@ -193,6 +195,8 @@ sealed class EventPayload {
         );
       case 'awaiting_input':
         return const AwaitingInputPayload();
+      case 'interrupted':
+        return InterruptedPayload(agent: json['agent'] as String);
       case 'access_report_updated':
         return AccessReportUpdatedPayload(
           report: AccessReport.fromJson(json['report'] as Map<String, dynamic>),
@@ -244,9 +248,13 @@ class HarnessStartedPayload extends EventPayload {
 }
 
 class UserPromptPayload extends EventPayload {
-  const UserPromptPayload({this.clientId, required this.text});
+  const UserPromptPayload({this.clientId, this.clientName, required this.text});
 
   final String? clientId;
+
+  /// Human-readable name of the client that sent the prompt. Absent when
+  /// the harness does not know one.
+  final String? clientName;
   final String text;
 
   @override
@@ -256,6 +264,7 @@ class UserPromptPayload extends EventPayload {
   Map<String, dynamic> toJson() => {
         'kind': kind,
         if (clientId != null) 'client_id': clientId,
+        if (clientName != null) 'client_name': clientName,
         'text': text,
       };
 }
@@ -317,19 +326,28 @@ class AgentSpawnedPayload extends EventPayload {
   const AgentSpawnedPayload({
     required this.parent,
     required this.agent,
+    this.name,
     required this.prompt,
   });
 
   final String parent;
   final String agent;
+
+  /// Name given to the subagent by the model. Absent when none was given.
+  final String? name;
   final String prompt;
 
   @override
   String get kind => 'agent_spawned';
 
   @override
-  Map<String, dynamic> toJson() =>
-      {'kind': kind, 'parent': parent, 'agent': agent, 'prompt': prompt};
+  Map<String, dynamic> toJson() => {
+        'kind': kind,
+        'parent': parent,
+        'agent': agent,
+        if (name != null) 'name': name,
+        'prompt': prompt,
+      };
 }
 
 class AgentCompletedPayload extends EventPayload {
@@ -461,6 +479,18 @@ class AwaitingInputPayload extends EventPayload {
 
   @override
   Map<String, dynamic> toJson() => {'kind': kind};
+}
+
+class InterruptedPayload extends EventPayload {
+  const InterruptedPayload({required this.agent});
+
+  final String agent;
+
+  @override
+  String get kind => 'interrupted';
+
+  @override
+  Map<String, dynamic> toJson() => {'kind': kind, 'agent': agent};
 }
 
 class AccessReportUpdatedPayload extends EventPayload {

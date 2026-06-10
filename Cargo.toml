@@ -9,7 +9,7 @@ members = [
     "crates/silo-frontend",
     "crates/silo-harness",
     "crates/silo-helper",
-    "crates/silo-tui",
+    "apps/silo-tui",
     "crates/silo",
 ]
 

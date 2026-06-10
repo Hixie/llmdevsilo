@@ -140,8 +140,15 @@ where
                 let tx = tx.clone();
                 let state = state.clone();
                 let id = request.id;
+                // Exec cancellation channels are registered here, before
+                // the task is spawned, so a Cancel read after the Exec on
+                // the same stream always finds the registration.
+                let cancel = match &op {
+                    HelperOp::Exec { .. } => Some(state.register_exec(id)),
+                    _ => None,
+                };
                 tokio::spawn(async move {
-                    let result = ops::handle_op(&state, op).await;
+                    let result = ops::handle_op(&state, id, op, cancel).await;
                     let response = HelperResponse { id, result };
                     let _ = tx
                         .send(Outgoing {

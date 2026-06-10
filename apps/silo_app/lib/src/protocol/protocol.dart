@@ -123,6 +123,8 @@ sealed class ClientMessage {
         return const RequestCostMessage();
       case 'request_pairing_code':
         return const RequestPairingCodeMessage();
+      case 'interrupt':
+        return const InterruptMessage();
       case 'shutdown':
         return const ShutdownMessage();
       case 'ping':
@@ -206,6 +208,13 @@ class RequestPairingCodeMessage extends ClientMessage {
 
   @override
   Map<String, dynamic> toJson() => {'type': 'request_pairing_code'};
+}
+
+class InterruptMessage extends ClientMessage {
+  const InterruptMessage();
+
+  @override
+  Map<String, dynamic> toJson() => {'type': 'interrupt'};
 }
 
 class ShutdownMessage extends ClientMessage {

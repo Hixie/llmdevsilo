@@ -25,6 +25,10 @@ pub struct Event {
     pub payload: EventPayload,
 }
 
+/// Answer recorded in `QuestionAnswered` for questions cancelled by a user
+/// interrupt.
+pub const INTERRUPTED_ANSWER: &str = "[interrupted]";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QuestionOption {
     pub label: String,
@@ -65,6 +69,10 @@ pub enum EventPayload {
     UserPrompt {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
+        /// Display name of the sending client (registered at pairing);
+        /// absent for local-token clients and non-interactive frontends.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_name: Option<String>,
         text: String,
     },
     AssistantText {
@@ -84,6 +92,10 @@ pub enum EventPayload {
     AgentSpawned {
         parent: AgentId,
         agent: AgentId,
+        /// Display name from the Agent tool's "name" input; absent when the
+        /// model gave none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         prompt: String,
     },
     AgentCompleted {
@@ -119,6 +131,10 @@ pub enum EventPayload {
         agent: AgentId,
         stop_reason: StopReason,
     },
+    /// The user aborted the turn; emitted in place of `TurnComplete`.
+    Interrupted {
+        agent: AgentId,
+    },
     /// The harness is idle and the next client input starts the next turn.
     AwaitingInput,
     AccessReportUpdated {
@@ -151,6 +167,7 @@ impl EventPayload {
             EventPayload::FileShared { .. } => "file_shared",
             EventPayload::CostReport { .. } => "cost_report",
             EventPayload::TurnComplete { .. } => "turn_complete",
+            EventPayload::Interrupted { .. } => "interrupted",
             EventPayload::AwaitingInput => "awaiting_input",
             EventPayload::AccessReportUpdated { .. } => "access_report_updated",
             EventPayload::Error { .. } => "error",
@@ -250,6 +267,7 @@ mod tests {
         let e0 = bus.emit(EventPayload::AwaitingInput);
         let e1 = bus.emit(EventPayload::UserPrompt {
             client_id: None,
+            client_name: None,
             text: "hi".into(),
         });
         assert_eq!(e0.seq, 0);
@@ -264,9 +282,102 @@ mod tests {
     fn payload_kind_matches_serialized_tag() {
         let payload = EventPayload::UserPrompt {
             client_id: None,
+            client_name: None,
             text: "x".into(),
         };
         let value = serde_json::to_value(&payload).unwrap();
         assert_eq!(value["kind"], payload.kind());
+    }
+
+    #[test]
+    fn user_prompt_wire_format_with_and_without_client_name() {
+        let named = EventPayload::UserPrompt {
+            client_id: Some("c1".into()),
+            client_name: Some("Ian's phone".into()),
+            text: "hello".into(),
+        };
+        let value = serde_json::to_value(&named).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "user_prompt",
+                "client_id": "c1",
+                "client_name": "Ian's phone",
+                "text": "hello",
+            })
+        );
+        let parsed: EventPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, named);
+
+        // The name is omitted when absent, and old payloads without the
+        // field still parse.
+        let anonymous = EventPayload::UserPrompt {
+            client_id: None,
+            client_name: None,
+            text: "hello".into(),
+        };
+        let value = serde_json::to_value(&anonymous).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"kind": "user_prompt", "text": "hello"})
+        );
+        let parsed: EventPayload =
+            serde_json::from_value(serde_json::json!({"kind": "user_prompt", "text": "hello"}))
+                .unwrap();
+        assert_eq!(parsed, anonymous);
+    }
+
+    #[test]
+    fn agent_spawned_wire_format_with_and_without_name() {
+        let named = EventPayload::AgentSpawned {
+            parent: "agent-0".into(),
+            agent: "agent-1".into(),
+            name: Some("refactor tests".into()),
+            prompt: "fix them".into(),
+        };
+        let value = serde_json::to_value(&named).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "agent_spawned",
+                "parent": "agent-0",
+                "agent": "agent-1",
+                "name": "refactor tests",
+                "prompt": "fix them",
+            })
+        );
+        let parsed: EventPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, named);
+
+        let unnamed_json = serde_json::json!({
+            "kind": "agent_spawned",
+            "parent": "agent-0",
+            "agent": "agent-1",
+            "prompt": "fix them",
+        });
+        let unnamed = EventPayload::AgentSpawned {
+            parent: "agent-0".into(),
+            agent: "agent-1".into(),
+            name: None,
+            prompt: "fix them".into(),
+        };
+        assert_eq!(serde_json::to_value(&unnamed).unwrap(), unnamed_json);
+        let parsed: EventPayload = serde_json::from_value(unnamed_json).unwrap();
+        assert_eq!(parsed, unnamed);
+    }
+
+    #[test]
+    fn interrupted_payload_wire_format() {
+        let payload = EventPayload::Interrupted {
+            agent: "agent-0".into(),
+        };
+        assert_eq!(payload.kind(), "interrupted");
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"kind": "interrupted", "agent": "agent-0"})
+        );
+        let parsed: EventPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, payload);
     }
 }

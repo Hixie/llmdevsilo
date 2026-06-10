@@ -22,7 +22,7 @@ use silo_core::traits::FrontendCommand;
 
 use super::auth;
 use super::http;
-use super::Shared;
+use super::{QuestionOutcome, Shared};
 
 type WsStream = WebSocketStream<http::PrefixedStream<tokio_rustls::server::TlsStream<TcpStream>>>;
 
@@ -110,7 +110,14 @@ async fn handle_connection(tcp: TcpStream, acceptor: TlsAcceptor, shared: Arc<Sh
         out_tx.clone(),
         shared.clone(),
     ));
-    read_incoming(stream, &out_tx, &shared, &client_id).await;
+    read_incoming(
+        stream,
+        &out_tx,
+        &shared,
+        &client_id,
+        outcome.client_name.as_deref(),
+    )
+    .await;
     pump.abort();
     // Dropping the last sender lets the writer drain and close the socket.
     drop(out_tx);
@@ -119,6 +126,8 @@ async fn handle_connection(tcp: TcpStream, acceptor: TlsAcceptor, shared: Arc<Sh
 
 struct AuthOutcome {
     key_id: Option<String>,
+    /// Display name registered at pairing; `None` for local-token clients.
+    client_name: Option<String>,
 }
 
 /// Runs the authentication phase. On success returns the outcome; on
@@ -152,7 +161,10 @@ async fn authenticate(ws: &mut WsStream, shared: &Arc<Shared>) -> Option<AuthOut
             AuthRequest::LocalToken { token } => {
                 let supplied = auth::sha256_digest(token.as_bytes());
                 return if auth::constant_time_eq(&supplied, &shared.token_digest) {
-                    Some(AuthOutcome { key_id: None })
+                    Some(AuthOutcome {
+                        key_id: None,
+                        client_name: None,
+                    })
                 } else {
                     deny(ws, "invalid token").await
                 };
@@ -181,6 +193,7 @@ async fn authenticate(ws: &mut WsStream, shared: &Arc<Shared>) -> Option<AuthOut
                 return match added {
                     Ok(key_id) => Some(AuthOutcome {
                         key_id: Some(key_id),
+                        client_name: Some(client_name).filter(|name| !name.is_empty()),
                     }),
                     Err(_) => deny(ws, "could not persist the public key").await,
                 };
@@ -231,8 +244,14 @@ async fn authenticate(ws: &mut WsStream, shared: &Arc<Shared>) -> Option<AuthOut
                         verifying_key.verify(&challenge, &signature).is_ok()
                     });
                 return if valid {
+                    let client_name = shared
+                        .keys
+                        .lock()
+                        .expect("authorized keys poisoned")
+                        .client_name(&key_id);
                     Some(AuthOutcome {
                         key_id: Some(key_id),
+                        client_name,
                     })
                 } else {
                     deny(ws, "invalid signature").await
@@ -335,6 +354,7 @@ async fn read_incoming(
     out_tx: &mpsc::UnboundedSender<ServerMessage>,
     shared: &Arc<Shared>,
     client_id: &str,
+    client_name: Option<&str>,
 ) {
     let mut shutdown_rx = shared.shutdown_tx.subscribe();
     if *shutdown_rx.borrow_and_update() {
@@ -360,7 +380,7 @@ async fn read_incoming(
                     Some(Ok(Message::Close(_))) => break,
                     Some(Ok(_)) => continue,
                 };
-                handle_message(message, out_tx, shared, client_id).await;
+                handle_message(message, out_tx, shared, client_id, client_name).await;
             },
         }
     }
@@ -371,6 +391,7 @@ async fn handle_message(
     out_tx: &mpsc::UnboundedSender<ServerMessage>,
     shared: &Arc<Shared>,
     client_id: &str,
+    client_name: Option<&str>,
 ) {
     match message {
         ClientMessage::Authenticate { .. } => {
@@ -381,6 +402,7 @@ async fn handle_message(
         ClientMessage::Prompt { text } => {
             shared.bus.emit(EventPayload::UserPrompt {
                 client_id: Some(client_id.to_string()),
+                client_name: client_name.map(str::to_string),
                 text: text.clone(),
             });
             let _ = shared.prompt_tx.send(text);
@@ -397,7 +419,10 @@ async fn handle_message(
             // The first answer takes the sender; later answers find the map
             // empty and are ignored.
             if let Some(sender) = sender {
-                if sender.send(answer.clone()).is_ok() {
+                if sender
+                    .send(QuestionOutcome::Answered(answer.clone()))
+                    .is_ok()
+                {
                     shared.bus.emit(EventPayload::QuestionAnswered {
                         id: question_id,
                         client_id: Some(client_id.to_string()),
@@ -405,6 +430,9 @@ async fn handle_message(
                     });
                 }
             }
+        }
+        ClientMessage::Interrupt => {
+            let _ = shared.commands.send(FrontendCommand::Interrupt).await;
         }
         ClientMessage::UploadFile { name, content_b64 } => {
             shared.bus.emit(EventPayload::FileShared {

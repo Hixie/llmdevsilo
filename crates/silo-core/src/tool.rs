@@ -40,6 +40,10 @@ pub struct ToolCall {
     pub input: serde_json::Value,
 }
 
+/// Tool-result content recorded for tool calls ended by a user interrupt:
+/// cancelled calls and questions resolved by an interrupt.
+pub const INTERRUPTED_BY_USER: &str = "[interrupted by the user]";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub content: String,

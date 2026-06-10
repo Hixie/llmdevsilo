@@ -14,6 +14,8 @@ class ChatView extends StatefulWidget {
     super.key,
     required this.store,
     required this.onAnswer,
+    this.selfClientId,
+    this.showRawPayloads = false,
   });
 
   final EventStore store;
@@ -21,6 +23,14 @@ class ChatView extends StatefulWidget {
   /// Called with (questionId, answer) when the user answers the live
   /// question.
   final void Function(String questionId, String answer) onAnswer;
+
+  /// This client's id, so prompts and uploads from other clients can be
+  /// labeled. Null while unknown.
+  final String? selfClientId;
+
+  /// Debug rendering: suppressed tool tiles appear and tool tiles show
+  /// their wire ids.
+  final bool showRawPayloads;
 
   @override
   State<ChatView> createState() => _ChatViewState();
@@ -78,7 +88,13 @@ class _ChatViewState extends State<ChatView> {
         _maybeAutoScroll(events.length);
         final tiles = <Widget>[];
         for (final event in events) {
-          final tile = buildEventTile(context, event, widget.store);
+          final tile = buildEventTile(
+            context,
+            event,
+            widget.store,
+            selfClientId: widget.selfClientId,
+            showRaw: widget.showRawPayloads,
+          );
           if (tile != null) {
             tiles.add(KeyedSubtree(
               key: ValueKey('event-${event.seq}'),

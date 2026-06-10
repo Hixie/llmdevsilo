@@ -310,6 +310,15 @@ impl Sandbox for GvisorBackend {
         .await
     }
 
+    /// Cancels in-flight helper executions so blocked `run_tool` calls
+    /// return with their partial output.
+    async fn interrupt(&self) -> Result<(), SandboxError> {
+        if let Some(running) = &self.running {
+            running.session.cancel_inflight().await;
+        }
+        Ok(())
+    }
+
     fn access_report(&self) -> AccessReport {
         let scratch_dir = match &self.running {
             Some(_) => spec::SCRATCH_DEST.to_string(),

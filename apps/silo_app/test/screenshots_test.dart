@@ -95,7 +95,39 @@ EventStore _demoStore() {
         isError: false,
       ),
     )),
-    _event(5, const QuestionAskedPayload(
+    _event(5, const UserPromptPayload(
+      clientId: 'c-2',
+      clientName: "Ian's phone",
+      text: 'Make sure the reconnect tests cover the new schedule too.',
+    )),
+    _event(6, const AgentSpawnedPayload(
+      parent: 'agent-0',
+      agent: 'agent-1',
+      name: 'audit reconnect tests',
+      prompt: 'Check that the reconnect tests cover exponential backoff '
+          'with jitter.',
+    )),
+    _event(7, const AssistantTextPayload(
+      agent: 'agent-1',
+      text: 'The suite pins the delay sequence but never asserts the '
+          'jitter bounds.',
+    )),
+    _event(8, const AgentCompletedPayload(
+      agent: 'agent-1',
+      result: 'Two coverage gaps found.',
+      isError: false,
+    )),
+    // Suppressed by default: the question card and transcript question
+    // tile carry this tool call.
+    _event(9, const ToolUsePayload(
+      agent: 'agent-0',
+      call: ToolCall(
+        id: 't-2',
+        name: 'AskUserQuestion',
+        input: {'question': 'Which backoff strategy?'},
+      ),
+    )),
+    _event(10, const QuestionAskedPayload(
       id: 'q-1',
       agent: 'agent-0',
       question: UserQuestion(
@@ -129,7 +161,7 @@ EventStore _demoStore() {
   return store;
 }
 
-Widget _chatScaffold(EventStore store) {
+Widget _chatScaffold(EventStore store, {bool busy = false}) {
   return RepaintBoundary(
     key: _boundaryKey,
     child: MaterialApp(
@@ -140,41 +172,75 @@ Widget _chatScaffold(EventStore store) {
         body: Column(
           children: [
             Expanded(
-              child: ChatView(store: store, onAnswer: (_, _) {}),
+              child: ChatView(
+                store: store,
+                onAnswer: (_, _) {},
+                selfClientId: 'c-1',
+              ),
             ),
+            if (busy) const LinearProgressIndicator(minHeight: 2),
             // Stand-in for the input row of ChatScreen, which needs a live
             // connection.
             Builder(builder: (context) {
               final scheme = Theme.of(context).colorScheme;
               return Container(
-                padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+                padding: const EdgeInsets.fromLTRB(contentGutter, 6, 8, 8),
                 decoration: BoxDecoration(
                   color: scheme.surfaceContainerLow,
                   border:
                       Border(top: BorderSide(color: scheme.outlineVariant)),
                 ),
-                child: Row(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const IconButton(
-                        icon: Icon(Icons.attach_file), onPressed: null),
-                    const Expanded(
-                      child: TextField(
-                        decoration: InputDecoration(
-                          hintText: 'Message the harness',
-                          border: OutlineInputBorder(
-                            borderRadius:
-                                BorderRadius.all(Radius.circular(24)),
-                          ),
-                          isDense: true,
-                          contentPadding: EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 10),
+                    if (busy)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(0, 0, 8, 4),
+                        child: Text(
+                          'working…',
+                          style: Theme.of(context)
+                              .textTheme
+                              .labelSmall
+                              ?.copyWith(color: scheme.outline),
                         ),
                       ),
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: TextField(
+                            decoration: InputDecoration(
+                              hintText: 'Message the harness',
+                              border: OutlineInputBorder(
+                                borderRadius:
+                                    BorderRadius.all(Radius.circular(24)),
+                              ),
+                              isDense: true,
+                              contentPadding: EdgeInsets.symmetric(
+                                  horizontal: 16, vertical: 10),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        const IconButton(
+                            icon: Icon(Icons.attach_file), onPressed: null),
+                        if (busy) ...[
+                          IconButton.filled(
+                            icon: const Icon(Icons.stop),
+                            tooltip: 'Stop',
+                            style: IconButton.styleFrom(
+                              backgroundColor: scheme.errorContainer,
+                              foregroundColor: scheme.onErrorContainer,
+                            ),
+                            onPressed: () {},
+                          ),
+                          const SizedBox(width: 6),
+                        ],
+                        IconButton.filled(
+                            icon: const Icon(Icons.arrow_upward),
+                            onPressed: () {}),
+                      ],
                     ),
-                    const SizedBox(width: 6),
-                    IconButton.filled(
-                        icon: const Icon(Icons.arrow_upward),
-                        onPressed: () {}),
                   ],
                 ),
               );
@@ -184,6 +250,41 @@ Widget _chatScaffold(EventStore store) {
       ),
     ),
   );
+}
+
+/// Transcript of a harness mid-task: the model is between tool calls, so
+/// the busy indicator and stop control are showing. Includes an earlier
+/// interruption so its tile is visible.
+EventStore _busyStore() {
+  final store = EventStore();
+  store.insertAll([
+    _event(0, const UserPromptPayload(
+      clientId: 'c-1',
+      text: 'Profile the websocket reconnect path and fix the hot spots.',
+    )),
+    _event(1, const AssistantTextPayload(
+      agent: 'agent-0',
+      text: 'Starting with a profile of the reconnect loop.',
+    )),
+    _event(2, const InterruptedPayload(agent: 'agent-0')),
+    _event(3, const UserPromptPayload(
+      clientId: 'c-1',
+      text: 'Sorry — only the backoff logic, skip the profiler.',
+    )),
+    _event(4, const AssistantTextPayload(
+      agent: 'agent-0',
+      text: 'Understood, narrowing to the backoff schedule.',
+    )),
+    _event(5, const ToolUsePayload(
+      agent: 'agent-0',
+      call: ToolCall(
+        id: 't-2',
+        name: 'Bash',
+        input: {'command': 'grep -n "backoff" crates/silo-net/src/client.rs'},
+      ),
+    )),
+  ]);
+  return store;
 }
 
 Future<void> _capture(WidgetTester tester, String name) async {
@@ -267,6 +368,40 @@ void main() {
       );
     });
   }
+
+  testWidgets('busy chat renders the progress bar, status, and stop button',
+      (tester) async {
+    final overflowErrors = <FlutterErrorDetails>[];
+    final originalOnError = FlutterError.onError;
+    FlutterError.onError = (details) {
+      if (details.exceptionAsString().contains('overflowed')) {
+        overflowErrors.add(details);
+      } else {
+        originalOnError?.call(details);
+      }
+    };
+    addTearDown(() => FlutterError.onError = originalOnError);
+
+    tester.view.physicalSize = const Size(900, 700);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(_chatScaffold(_busyStore(), busy: true));
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.byType(LinearProgressIndicator), findsOneWidget);
+    expect(find.text('working…'), findsOneWidget);
+    expect(find.byTooltip('Stop'), findsOneWidget);
+    expect(find.text('interrupted by the user'), findsOneWidget);
+    await _capture(tester, 'chat_busy_900x700');
+
+    expect(
+      overflowErrors,
+      isEmpty,
+      reason: 'render overflow in busy chat: '
+          '${overflowErrors.map((e) => e.exceptionAsString()).join('; ')}',
+    );
+  });
 
   testWidgets('pairing sheet renders without overflow at 900x700',
       (tester) async {

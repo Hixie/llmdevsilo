@@ -81,6 +81,91 @@ void main() {
     expect(store.liveQuestion?.id, 'q-2');
   });
 
+  group('isBusy', () {
+    test('an empty store is idle', () {
+      expect(EventStore().isBusy, isFalse);
+    });
+
+    test('activity events set the flag, idle events clear it', () {
+      final store = EventStore();
+      store.insert(event(0, const HarnessStartedPayload(
+        harnessId: 'h-1',
+        workspace: '/w',
+        sandbox: 'mock',
+        llm: 'anthropic',
+      )));
+      expect(store.isBusy, isFalse, reason: 'harness_started is neutral');
+
+      store.insert(event(1, const UserPromptPayload(text: 'go')));
+      expect(store.isBusy, isTrue);
+
+      store.insert(event(2, const AssistantTextPayload(
+        agent: 'agent-0',
+        text: 'working',
+      )));
+      expect(store.isBusy, isTrue);
+
+      store.insert(event(3, const AwaitingInputPayload()));
+      expect(store.isBusy, isFalse);
+
+      store.insert(event(4, const ToolUsePayload(
+        agent: 'agent-0',
+        call: ToolCall(id: 't', name: 'Bash', input: null),
+      )));
+      expect(store.isBusy, isTrue);
+
+      store.insert(event(5, const InterruptedPayload(agent: 'agent-0')));
+      expect(store.isBusy, isFalse);
+
+      store.insert(event(6, const QuestionAskedPayload(
+        id: 'q',
+        agent: 'agent-0',
+        question: UserQuestion(question: '?'),
+      )));
+      expect(store.isBusy, isTrue);
+
+      store.insert(event(7, const ShutdownPayload()));
+      expect(store.isBusy, isFalse);
+    });
+
+    test('neutral events do not change the flag', () {
+      final store = EventStore();
+      store.insert(event(0, const UserPromptPayload(text: 'go')));
+      store.insert(event(1, const TurnCompletePayload(
+        agent: 'agent-0',
+        stopReason: StopReason.endTurn,
+      )));
+      store.insert(event(2, const CostReportPayload(
+        backend: 'anthropic',
+        usage: UsageSnapshot(inputTokens: 1, outputTokens: 1, usd: 0.1),
+        quota: QuotaConfig(),
+      )));
+      store.insert(event(3, const ErrorPayload(context: 'llm', message: 'x')));
+      expect(store.isBusy, isTrue);
+    });
+
+    test('the highest-sequence event wins regardless of insert order', () {
+      final store = EventStore();
+      store.insert(event(5, const AwaitingInputPayload()));
+      store.insert(event(3, const UserPromptPayload(text: 'late backlog')));
+      expect(store.isBusy, isFalse);
+
+      store.insertAll([
+        event(7, const UserPromptPayload(text: 'next')),
+        event(6, const AwaitingInputPayload()),
+      ]);
+      expect(store.isBusy, isTrue);
+    });
+
+    test('clear resets the flag', () {
+      final store = EventStore();
+      store.insert(event(0, const UserPromptPayload(text: 'go')));
+      expect(store.isBusy, isTrue);
+      store.clear();
+      expect(store.isBusy, isFalse);
+    });
+  });
+
   test('latestCostReports keeps the most recent report per backend', () {
     final store = EventStore();
     store.insert(event(0, const CostReportPayload(

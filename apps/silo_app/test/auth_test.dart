@@ -90,11 +90,13 @@ Future<void> waitFor(
 void main() {
   test('local token auth then backlog request from seq 0', () async {
     final secrets = MemorySecretStore();
+    final settings = MemorySecretStore();
     secrets.values[endpoint.tokenKey] = 'a' * 64;
     final factory = MockFactory();
     final connection = HarnessConnection(
       endpoint: endpoint,
       secrets: secrets,
+      settings: settings,
       channelFactory: factory.connect,
       backoff: (_) => Duration.zero,
     );
@@ -129,10 +131,12 @@ void main() {
   test('pairing generates a key pair and stores the seed and key id',
       () async {
     final secrets = MemorySecretStore();
+    final settings = MemorySecretStore();
     final factory = MockFactory();
     final connection = HarnessConnection(
       endpoint: endpoint,
       secrets: secrets,
+      settings: settings,
       channelFactory: factory.connect,
       clientName: 'phone',
       backoff: (_) => Duration.zero,
@@ -162,7 +166,7 @@ void main() {
     await channel.waitForSent(4);
     expect(connection.status, ConnectionStatus.connected);
     expect(connection.pendingPairingCode, isNull);
-    expect(secrets.values[endpoint.keyIdKey], 'key-9');
+    expect(settings.values[endpoint.keyIdKey], 'key-9');
 
     // The stored seed reproduces the public key sent during pairing.
     final seed = base64Decode(secrets.values[endpoint.keySeedKey]!);
@@ -181,12 +185,14 @@ void main() {
     final publicKey = await keyPair.extractPublicKey();
 
     final secrets = MemorySecretStore();
-    secrets.values[endpoint.keyIdKey] = 'key-1';
+    final settings = MemorySecretStore();
+    settings.values[endpoint.keyIdKey] = 'key-1';
     secrets.values[endpoint.keySeedKey] = base64Encode(seed);
     final factory = MockFactory();
     final connection = HarnessConnection(
       endpoint: endpoint,
       secrets: secrets,
+      settings: settings,
       channelFactory: factory.connect,
       backoff: (_) => Duration.zero,
     );
@@ -233,11 +239,13 @@ void main() {
 
   test('auth_error fails the connection without reconnecting', () async {
     final secrets = MemorySecretStore();
+    final settings = MemorySecretStore();
     secrets.values[endpoint.tokenKey] = 'bad';
     final factory = MockFactory();
     final connection = HarnessConnection(
       endpoint: endpoint,
       secrets: secrets,
+      settings: settings,
       channelFactory: factory.connect,
       backoff: (_) => Duration.zero,
     );
@@ -259,10 +267,12 @@ void main() {
 
   test('no credentials at all fails cleanly', () async {
     final secrets = MemorySecretStore();
+    final settings = MemorySecretStore();
     final factory = MockFactory();
     final connection = HarnessConnection(
       endpoint: endpoint,
       secrets: secrets,
+      settings: settings,
       channelFactory: factory.connect,
       backoff: (_) => Duration.zero,
     );
@@ -278,11 +288,13 @@ void main() {
   test('reconnect resumes the event stream from the next sequence number',
       () async {
     final secrets = MemorySecretStore();
+    final settings = MemorySecretStore();
     secrets.values[endpoint.tokenKey] = 'tok';
     final factory = MockFactory();
     final connection = HarnessConnection(
       endpoint: endpoint,
       secrets: secrets,
+      settings: settings,
       channelFactory: factory.connect,
       backoff: (_) => Duration.zero,
     );
@@ -361,14 +373,75 @@ void main() {
     await connection.disconnect();
   });
 
+  test('automatic retries stop at the cap and park in failed', () async {
+    var attempts = 0;
+    final connection = HarnessConnection(
+      endpoint: endpoint,
+      secrets: MemorySecretStore(),
+      settings: MemorySecretStore(),
+      channelFactory: (uri, fingerprint) async {
+        attempts += 1;
+        throw Exception('connection refused');
+      },
+      backoff: (_) => Duration.zero,
+      maxAutoReconnects: 3,
+    );
+
+    await connection.connect();
+    await waitFor(() => connection.status == ConnectionStatus.failed,
+        reason: 'failed status after the retry cap');
+    // The initial attempt plus three automatic retries.
+    expect(attempts, 4);
+    expect(connection.lastError, contains('connection refused'));
+
+    // Parked: no further attempts happen on their own.
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(attempts, 4);
+
+    // A manual retry resets the budget and runs the same cycle again.
+    await connection.connect();
+    await waitFor(() => connection.status == ConnectionStatus.failed,
+        reason: 'failed status after the second cycle');
+    expect(attempts, 8);
+
+    connection.dispose();
+  });
+
+  test('reconnecting exposes the attempt number and a retry countdown',
+      () async {
+    final connection = HarnessConnection(
+      endpoint: endpoint,
+      secrets: MemorySecretStore(),
+      settings: MemorySecretStore(),
+      channelFactory: (uri, fingerprint) async =>
+          throw Exception('connection refused'),
+      backoff: (_) => const Duration(seconds: 30),
+    );
+
+    await connection.connect();
+    await waitFor(() => connection.status == ConnectionStatus.reconnecting,
+        reason: 'reconnecting status');
+    expect(connection.reconnectAttempt, 1);
+    final wait = connection.nextRetryIn;
+    expect(wait, isNotNull);
+    expect(wait!.inSeconds, lessThanOrEqualTo(30));
+    expect(wait, greaterThan(const Duration(seconds: 25)));
+
+    await connection.disconnect();
+    expect(connection.nextRetryIn, isNull);
+    connection.dispose();
+  });
+
   test('pinned fingerprint is passed to the channel factory', () async {
     final secrets = MemorySecretStore();
+    final settings = MemorySecretStore();
     secrets.values[endpoint.tokenKey] = 'tok';
-    secrets.values[endpoint.fingerprintKey] = 'deadbeef';
+    settings.values[endpoint.fingerprintKey] = 'deadbeef';
     final factory = MockFactory();
     final connection = HarnessConnection(
       endpoint: endpoint,
       secrets: secrets,
+      settings: settings,
       channelFactory: factory.connect,
       backoff: (_) => Duration.zero,
     );

@@ -3,10 +3,12 @@
 //! Consumes the frontend portion of a [`SharedScript`] strictly in order.
 //! `SendPrompt` steps supply user input, `ExpectEvent` steps block until a
 //! matching event has been observed on the bus, `AnswerQuestion` steps
-//! answer AskUserQuestion calls, `UploadFile` steps emit a client-origin
-//! FileShared event and block until the harness has stored the upload via
-//! the scripted sandbox Write, and `ExpectShutdown` matches the final
-//! shutdown message. Sequencing is by script position and event
+//! answer AskUserQuestion calls, `Interrupt` steps send
+//! `FrontendCommand::Interrupt` (resolving the current AskUserQuestion as
+//! interrupted when consumed inside one), `UploadFile` steps emit a
+//! client-origin FileShared event and block until the harness has stored
+//! the upload via the scripted sandbox Write, and `ExpectShutdown` matches
+//! the final shutdown message. Sequencing is by script position and event
 //! observation only; no timers are involved.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +23,7 @@ use silo_core::conversation::AgentId;
 use silo_core::error::FrontendError;
 use silo_core::event::{EventBus, EventPayload, FileOrigin};
 use silo_core::replay::{FrontendStep, SharedScript};
-use silo_core::tool::{ToolCall, ToolDef, ToolOutput};
+use silo_core::tool::{ToolCall, ToolDef, ToolOutput, INTERRUPTED_BY_USER};
 use silo_core::traits::{Frontend, FrontendCommand, FrontendContext};
 
 use crate::tools;
@@ -165,6 +167,17 @@ impl Frontend for MockFrontend {
                     }
                 }
                 Some(FrontendStep::SendPrompt { text }) => return Ok(text),
+                Some(FrontendStep::Interrupt) => {
+                    // An interrupt while the harness is idle: send the
+                    // command and continue with the next step.
+                    started
+                        .commands
+                        .send(FrontendCommand::Interrupt)
+                        .await
+                        .map_err(|_| {
+                            FrontendError::Closed("the harness command channel is closed".into())
+                        })?;
+                }
                 Some(other) => {
                     return Err(self.mismatch(&format!(
                         "expected a SendPrompt step when asked for user input, found {other:?}"
@@ -244,6 +257,20 @@ impl Frontend for MockFrontend {
                                 answer: answer.clone(),
                             });
                             return Ok(ToolOutput::ok(answer));
+                        }
+                        Some(FrontendStep::Interrupt) => {
+                            // The interrupt cancels this question: send the
+                            // command and resolve the call as interrupted.
+                            started
+                                .commands
+                                .send(FrontendCommand::Interrupt)
+                                .await
+                                .map_err(|_| {
+                                    FrontendError::Closed(
+                                        "the harness command channel is closed".into(),
+                                    )
+                                })?;
+                            return Ok(ToolOutput::error(INTERRUPTED_BY_USER));
                         }
                         Some(other) => {
                             return Err(self.mismatch(&format!(
@@ -454,6 +481,45 @@ mod tests {
             "remaining: {}",
             script.remaining_summary()
         );
+    }
+
+    #[tokio::test]
+    async fn interrupt_step_during_input_sends_the_command_and_continues() {
+        let bus = bus();
+        let script = SharedScript::new(TestScript {
+            frontend: vec![
+                FrontendStep::Interrupt,
+                FrontendStep::SendPrompt { text: "go".into() },
+            ],
+            ..TestScript::default()
+        });
+        let (frontend, mut rx) = started_frontend(script.clone(), &bus).await;
+        assert_eq!(frontend.next_user_input().await.unwrap(), "go");
+        assert_eq!(rx.recv().await.unwrap(), FrontendCommand::Interrupt);
+        assert!(script.finished());
+    }
+
+    #[tokio::test]
+    async fn interrupt_step_during_a_question_resolves_it_as_interrupted() {
+        let bus = bus();
+        let script = SharedScript::new(TestScript {
+            frontend: vec![FrontendStep::Interrupt],
+            ..TestScript::default()
+        });
+        let (frontend, mut rx) = started_frontend(script.clone(), &bus).await;
+        let call = ToolCall {
+            id: "t1".into(),
+            name: "AskUserQuestion".into(),
+            input: json!({"question": "Proceed?"}),
+        };
+        let output = frontend
+            .run_tool(&"agent-0".to_string(), &call)
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert_eq!(output.content, "[interrupted by the user]");
+        assert_eq!(rx.recv().await.unwrap(), FrontendCommand::Interrupt);
+        assert!(script.finished());
     }
 
     #[tokio::test]

@@ -171,6 +171,69 @@ async fn write_then_read_roundtrip() {
 }
 
 #[tokio::test]
+async fn cancel_ends_a_slow_exec_promptly() {
+    let mut client = RawClient::start();
+    client
+        .send(
+            1,
+            HelperOp::Exec {
+                command: "sleep 30".into(),
+                cwd: None,
+                env: vec![],
+                timeout_ms: 120_000,
+            },
+        )
+        .await;
+    client.send(2, HelperOp::Cancel { id: 1 }).await;
+
+    let started = std::time::Instant::now();
+    let mut exec_response = None;
+    let mut cancel_response = None;
+    while exec_response.is_none() || cancel_response.is_none() {
+        let response = client.recv().await;
+        match response.id {
+            1 => exec_response = Some(response),
+            2 => cancel_response = Some(response),
+            other => panic!("unexpected response id {other}"),
+        }
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "cancel did not end the exec promptly"
+    );
+    match exec_response.unwrap().result.unwrap() {
+        HelperPayload::Exec {
+            exit_code,
+            timed_out,
+            cancelled,
+            ..
+        } => {
+            assert_eq!(exit_code, -1);
+            assert!(cancelled);
+            assert!(!timed_out);
+        }
+        other => panic!("expected Exec payload, got {other:?}"),
+    }
+    assert_eq!(cancel_response.unwrap().result.unwrap(), HelperPayload::Ack);
+}
+
+#[tokio::test]
+async fn cancel_of_an_unknown_id_answers_without_killing_the_session() {
+    let mut client = RawClient::start();
+    client.send(1, HelperOp::Cancel { id: 999 }).await;
+    let response = client.recv().await;
+    assert_eq!(response.id, 1);
+    let err = response.result.unwrap_err();
+    assert!(err.contains("999"), "unexpected error: {err}");
+
+    // The serve loop is still alive.
+    client.send(2, HelperOp::Hello).await;
+    let response = client.recv().await;
+    assert_eq!(response.id, 2);
+    assert!(response.result.is_ok());
+}
+
+#[tokio::test]
 async fn shutdown_acks_then_ends_the_stream() {
     let mut client = RawClient::start();
     client.send(7, HelperOp::Shutdown).await;

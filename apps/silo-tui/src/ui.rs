@@ -22,7 +22,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_input(frame, app, input_area);
 
     if let Some(question) = &app.question {
-        draw_question(frame, question);
+        draw_question(frame, app, question);
     }
     if let Some(popup) = &app.popup {
         draw_popup(frame, popup);
@@ -40,6 +40,7 @@ fn style_for(kind: ItemKind) -> Style {
         ItemKind::Answer => Style::new().fg(Color::Blue),
         ItemKind::FileNote => Style::new().fg(Color::Green),
         ItemKind::System => Style::new().add_modifier(Modifier::DIM),
+        ItemKind::Interrupted => Style::new().fg(Color::Red).add_modifier(Modifier::DIM),
         ItemKind::Error => Style::new().fg(Color::Red),
         ItemKind::Shutdown => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
     }
@@ -96,7 +97,9 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// The transcript flattened into display lines for a given width.
+/// The transcript flattened into display lines for a given width. In
+/// debug mode each item's raw ids are appended to its last line in dim
+/// brackets.
 fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for item in &app.transcript {
@@ -104,6 +107,18 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         for raw in item.text.split('\n') {
             for wrapped in wrap_text(raw, width) {
                 lines.push(Line::styled(wrapped, style));
+            }
+        }
+        if app.debug {
+            if let Some(ids) = &item.debug {
+                let suffix = Span::styled(
+                    format!(" [{ids}]"),
+                    Style::new().add_modifier(Modifier::DIM),
+                );
+                match lines.last_mut() {
+                    Some(last) => last.spans.push(suffix),
+                    None => lines.push(Line::from(vec![suffix])),
+                }
             }
         }
     }
@@ -145,21 +160,30 @@ fn conn_span(conn: &ConnState) -> Span<'static> {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let mut left = vec![
-        Span::styled(
-            format!(" {} ", app.harness_id),
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        conn_span(&app.conn),
-    ];
+    let mut left = vec![Span::styled(
+        format!(" {} ", app.harness_label()),
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.debug && !app.harness_id.is_empty() {
+        left.push(Span::styled(
+            format!(" [{}]", app.harness_id),
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+    }
+    left.push(Span::raw(" "));
+    left.push(conn_span(&app.conn));
     if app.question.is_some() {
         left.push(Span::styled(
             "  · question pending",
             Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+    } else if app.busy {
+        left.push(Span::styled(
+            format!("  · {} working (esc to interrupt)", app.spinner_char()),
+            Style::new().fg(Color::Yellow),
         ));
     } else if app.awaiting_input {
         left.push(Span::styled(
@@ -241,7 +265,7 @@ fn draw_modal(frame: &mut Frame, title: &str, lines: Vec<Line<'static>>, footer:
     frame.render_widget(Paragraph::new(wrapped).block(block), rect);
 }
 
-fn draw_question(frame: &mut Frame, pending: &PendingQuestion) {
+fn draw_question(frame: &mut Frame, app: &App, pending: &PendingQuestion) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::styled(
         pending.question.question.clone(),
@@ -301,7 +325,14 @@ fn draw_question(frame: &mut Frame, pending: &PendingQuestion) {
             hints.push("type: free text");
         }
     }
-    let title = format!("question from {}", pending.agent);
+    let title = if pending.agent == "agent-0" {
+        "question".to_string()
+    } else {
+        format!(
+            "question from {}",
+            crate::app::subagent_label(&pending.agent, &app.agent_names)
+        )
+    };
     draw_modal(frame, &title, lines, &hints.join(" · "));
 }
 
@@ -407,6 +438,26 @@ fn draw_popup(frame: &mut Frame, popup: &Popup) {
             ];
             draw_modal(frame, "pair another device", lines, "any key to close");
         }
+        Popup::Help => {
+            let usage_width = crate::commands::COMMANDS
+                .iter()
+                .map(|spec| spec.usage.chars().count())
+                .max()
+                .unwrap_or(0);
+            let lines: Vec<Line<'static>> = crate::commands::COMMANDS
+                .iter()
+                .map(|spec| {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{:<width$}  ", spec.usage, width = usage_width),
+                            Style::new().fg(Color::Cyan),
+                        ),
+                        Span::raw(spec.description),
+                    ])
+                })
+                .collect();
+            draw_modal(frame, "commands", lines, "any key to close");
+        }
     }
 }
 
@@ -462,35 +513,123 @@ mod tests {
 
     #[test]
     fn renders_status_bar_and_transcript() {
-        let mut app = App::new("h42".into(), "127.0.0.1:1".into(), "00".repeat(32));
+        let mut app = App::new("127.0.0.1:1".into(), "00".repeat(32), None);
         app.handle_net(crate::net::NetEvent::Connected {
-            harness_id: "h42".into(),
+            harness_id: "deadbeef42".into(),
         });
         app.apply_event(event(
             0,
-            EventPayload::UserPrompt {
-                client_id: Some("client-1".into()),
-                text: "build it".into(),
+            EventPayload::HarnessStarted {
+                harness_id: "deadbeef42".into(),
+                workspace: "/home/user/myproject".into(),
+                sandbox: "mock".into(),
+                llm: "mock".into(),
             },
         ));
         app.apply_event(event(
             1,
+            EventPayload::UserPrompt {
+                client_id: Some("client-1".into()),
+                client_name: Some("Ian's phone".into()),
+                text: "build it".into(),
+            },
+        ));
+        app.apply_event(event(
+            2,
             EventPayload::AssistantText {
                 agent: "agent-0".into(),
                 text: "on it".into(),
             },
         ));
         let text = render(&app);
-        assert!(text.contains("h42"));
+        // The harness is identified by the workspace folder name, not the
+        // hex id.
+        assert!(text.contains(" myproject "));
+        assert!(!text.contains("deadbeef42"));
         assert!(text.contains("connected"));
-        assert!(text.contains("client-1 > build it"));
+        assert!(text.contains("Ian's phone > build it"));
+        assert!(!text.contains("client-1"));
         assert!(text.contains("on it"));
         assert!(text.contains("$0.0000 | 0 tok"));
     }
 
     #[test]
+    fn status_bar_falls_back_to_the_address_before_harness_started() {
+        let app = App::new("host.example:9000".into(), "00".repeat(32), None);
+        let text = render(&app);
+        assert!(text.contains("host.example:9000"));
+    }
+
+    #[test]
+    fn debug_mode_appends_raw_ids() {
+        let mut app = App::new("127.0.0.1:1".into(), "00".repeat(32), None);
+        app.apply_event(event(
+            0,
+            EventPayload::HarnessStarted {
+                harness_id: "deadbeef42".into(),
+                workspace: "/home/user/myproject".into(),
+                sandbox: "mock".into(),
+                llm: "mock".into(),
+            },
+        ));
+        app.apply_event(event(
+            1,
+            EventPayload::ToolUse {
+                agent: "agent-0".into(),
+                call: silo_core::tool::ToolCall {
+                    id: "toolu_77".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                },
+            },
+        ));
+        let plain = render(&app);
+        assert!(!plain.contains("deadbeef42"));
+        assert!(!plain.contains("toolu_77"));
+
+        app.input = "/debug".into();
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.debug);
+        let debug = render(&app);
+        assert!(debug.contains("deadbeef42"));
+        assert!(debug.contains("[agent-0 toolu_77]"));
+    }
+
+    #[test]
+    fn status_bar_shows_working_then_awaiting_input() {
+        let mut app = App::new("a:1".into(), "00".repeat(32), None);
+        app.apply_event(event(
+            0,
+            EventPayload::UserPrompt {
+                client_id: None,
+                client_name: None,
+                text: "go".into(),
+            },
+        ));
+        let busy = render(&app);
+        assert!(busy.contains("working"));
+        assert!(busy.contains(app.spinner_char()));
+        assert!(!busy.contains("awaiting input"));
+
+        app.apply_event(event(
+            1,
+            EventPayload::Interrupted {
+                agent: "agent-0".into(),
+            },
+        ));
+        app.apply_event(event(2, EventPayload::AwaitingInput));
+        let idle = render(&app);
+        assert!(!idle.contains("working"));
+        assert!(idle.contains("awaiting input"));
+        assert!(idle.contains("■ interrupted by the user"));
+    }
+
+    #[test]
     fn renders_question_modal_with_options() {
-        let mut app = App::new("h".into(), "a:1".into(), "00".repeat(32));
+        let mut app = App::new("a:1".into(), "00".repeat(32), None);
         app.apply_event(event(
             0,
             EventPayload::QuestionAsked {
@@ -514,7 +653,9 @@ mod tests {
             },
         ));
         let text = render(&app);
-        assert!(text.contains("question from agent-0"));
+        // The top-level agent's question carries no agent id in the title.
+        assert!(text.contains(" question "));
+        assert!(!text.contains("agent-0"));
         assert!(text.contains("Deploy now?"));
         assert!(text.contains("> yes"));
         assert!(text.contains("ship it"));
@@ -522,8 +663,57 @@ mod tests {
     }
 
     #[test]
+    fn question_modal_titles_a_named_subagent() {
+        let mut app = App::new("a:1".into(), "00".repeat(32), None);
+        app.apply_event(event(
+            0,
+            EventPayload::AgentSpawned {
+                parent: "agent-0".into(),
+                agent: "agent-1".into(),
+                name: Some("refactor tests".into()),
+                prompt: "do it".into(),
+            },
+        ));
+        app.apply_event(event(
+            1,
+            EventPayload::QuestionAsked {
+                id: "q1".into(),
+                agent: "agent-1".into(),
+                question: UserQuestion {
+                    question: "Proceed?".into(),
+                    options: vec![],
+                    multi_select: false,
+                    allow_free_text: true,
+                },
+            },
+        ));
+        let text = render(&app);
+        assert!(text.contains("question from subagent refactor tests"));
+        assert!(!text.contains("agent-1"));
+    }
+
+    #[test]
+    fn renders_help_popup_with_every_command() {
+        let mut app = App::new("a:1".into(), "00".repeat(32), None);
+        app.input = "/help".into();
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let text = render(&app);
+        assert!(text.contains(" commands "));
+        for spec in crate::commands::COMMANDS {
+            assert!(
+                text.contains(spec.name),
+                "help popup is missing {}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
     fn renders_access_popup() {
-        let mut app = App::new("h".into(), "a:1".into(), "00".repeat(32));
+        let mut app = App::new("a:1".into(), "00".repeat(32), None);
         app.handle_server(silo_core::protocol::ServerMessage::AccessReport {
             report: AccessReport {
                 sandbox_kind: "mock".into(),
@@ -545,7 +735,7 @@ mod tests {
 
     #[test]
     fn renders_pairing_popup_with_connect_hint() {
-        let mut app = App::new("h".into(), "host.example:9000".into(), "ab".repeat(32));
+        let mut app = App::new("host.example:9000".into(), "ab".repeat(32), None);
         app.handle_server(silo_core::protocol::ServerMessage::PairingCode {
             code: "ZZZZ9999".into(),
             expires_in_secs: 120,
@@ -557,7 +747,7 @@ mod tests {
 
     #[test]
     fn scrolled_transcript_shows_older_lines() {
-        let mut app = App::new("h".into(), "a:1".into(), "00".repeat(32));
+        let mut app = App::new("a:1".into(), "00".repeat(32), None);
         for i in 0..100 {
             app.apply_event(event(
                 i,

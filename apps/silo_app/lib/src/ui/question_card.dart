@@ -5,6 +5,7 @@ library;
 import 'package:flutter/material.dart';
 
 import '../protocol/event.dart';
+import 'theme.dart';
 
 /// Renders a live [UserQuestion]. Single-select options answer immediately
 /// when tapped; multi-select shows checkbox tiles and a submit button; an
@@ -74,6 +75,8 @@ class _QuestionCardState extends State<QuestionCard> {
     }
   }
 
+  /// Header row: the circled question-mark icon, top-aligned with the
+  /// first line of the question text.
   Widget _header(ThemeData theme) {
     final scheme = theme.colorScheme;
     return Row(
@@ -94,12 +97,9 @@ class _QuestionCardState extends State<QuestionCard> {
         ),
         const SizedBox(width: 10),
         Expanded(
-          child: Padding(
-            padding: const EdgeInsets.only(top: 3),
-            child: Text(
-              _question.question,
-              style: theme.textTheme.titleMedium,
-            ),
+          child: Text(
+            _question.question,
+            style: theme.textTheme.titleMedium,
           ),
         ),
       ],
@@ -219,7 +219,7 @@ class _QuestionCardState extends State<QuestionCard> {
     final scheme = theme.colorScheme;
     final question = _question;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+      padding: const EdgeInsets.fromLTRB(contentGutter, 4, contentGutter, 8),
       child: Material(
         color: scheme.surfaceContainerHigh,
         elevation: 1,

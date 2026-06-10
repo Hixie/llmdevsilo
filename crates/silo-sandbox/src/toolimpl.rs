@@ -279,6 +279,7 @@ async fn bash_tool(
         stderr,
         timed_out,
         truncated,
+        cancelled,
     } = payload
     else {
         return Err(unexpected_payload("Bash", payload));
@@ -296,13 +297,15 @@ async fn bash_tool(
     if truncated {
         sections.push("[output truncated]".to_string());
     }
-    if timed_out {
+    if cancelled {
+        sections.push("(cancelled)".to_string());
+    } else if timed_out {
         sections.push("(timed out)".to_string());
     } else if exit_code != 0 {
         sections.push(format!("(exit code {exit_code})"));
     }
     let content = sections.join("\n");
-    if timed_out || exit_code != 0 {
+    if cancelled || timed_out || exit_code != 0 {
         Ok(ToolOutput::error(content))
     } else {
         Ok(ToolOutput::ok(content))

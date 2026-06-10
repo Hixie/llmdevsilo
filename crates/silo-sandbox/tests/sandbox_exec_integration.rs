@@ -291,6 +291,64 @@ async fn user_shell_runs_in_the_workspace_and_stays_confined() {
 
 #[tokio::test]
 #[ignore = "requires a working /usr/bin/sandbox-exec"]
+async fn interrupt_cancels_a_slow_bash_command() {
+    let mut setup = start_sandbox().await;
+
+    let started = std::time::Instant::now();
+    let slow_call = call(
+        "Bash",
+        serde_json::json!({"command": "echo before-sleep; sleep 30; echo after-sleep"}),
+    );
+    let agent = "agent-0".to_string();
+    let output = {
+        let sandbox: &dyn Sandbox = setup.sandbox.as_ref();
+        let slow = sandbox.run_tool(&agent, &slow_call);
+        tokio::pin!(slow);
+        // Give the command time to start and emit its first line, then
+        // cancel.
+        tokio::select! {
+            output = &mut slow => panic!("the command finished before the interrupt: {output:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                sandbox.interrupt().await.expect("interrupt");
+                tokio::time::timeout(std::time::Duration::from_secs(10), slow)
+                    .await
+                    .expect("run_tool did not return promptly after the interrupt")
+                    .expect("run_tool transport")
+            }
+        }
+    };
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "cancellation took {:?}",
+        started.elapsed()
+    );
+    assert!(output.is_error, "expected an error output: {output:?}");
+    assert!(
+        output.content.contains("(cancelled)"),
+        "missing cancelled marker: {}",
+        output.content
+    );
+    assert!(
+        output.content.contains("before-sleep"),
+        "partial stdout missing: {}",
+        output.content
+    );
+    assert!(!output.content.contains("after-sleep"));
+
+    // The session still serves tool calls after a cancellation.
+    let output = run(&setup, "Bash", serde_json::json!({"command": "echo alive"})).await;
+    assert!(
+        !output.is_error,
+        "follow-up Bash failed: {}",
+        output.content
+    );
+    assert!(output.content.contains("alive"));
+
+    setup.sandbox.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires a working /usr/bin/sandbox-exec"]
 async fn shutdown_removes_the_scratch_space() {
     let mut setup = start_sandbox().await;
     let scratch_dir = PathBuf::from(setup.sandbox.access_report().scratch_dir);

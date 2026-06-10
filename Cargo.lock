@@ -2013,6 +2013,7 @@ name = "silo-helper"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

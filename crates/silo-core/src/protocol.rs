@@ -76,6 +76,8 @@ pub enum ClientMessage {
     RequestCost,
     /// Ask the harness to issue a one-time pairing code for another client.
     RequestPairingCode,
+    /// Ask the harness to abort the in-progress turn.
+    Interrupt,
     /// Ask the harness to shut down.
     Shutdown,
     Ping {
@@ -171,6 +173,15 @@ mod tests {
         let value = serde_json::to_value(&message).unwrap();
         assert_eq!(value["type"], "authenticate");
         assert_eq!(value["method"], "local_token");
+        let parsed: ClientMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, message);
+    }
+
+    #[test]
+    fn interrupt_wire_format_is_a_bare_type_tag() {
+        let message = ClientMessage::Interrupt;
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value, serde_json::json!({"type": "interrupt"}));
         let parsed: ClientMessage = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, message);
     }

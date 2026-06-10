@@ -47,6 +47,13 @@ pub trait Sandbox: Send + Sync {
     /// Executes one tool call inside the sandbox via the helper process.
     async fn run_tool(&self, agent: &AgentId, call: &ToolCall) -> Result<ToolOutput, SandboxError>;
 
+    /// Called by the harness when an interrupt begins. Cancels in-flight
+    /// tool executions so blocked `run_tool` calls return promptly with
+    /// their partial output. The default does nothing.
+    async fn interrupt(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// What the sandboxed LLM can reach, for user inspection.
     fn access_report(&self) -> AccessReport;
 
@@ -97,6 +104,9 @@ pub enum FrontendCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// Abort the in-progress turn; the harness unwinds at its next
+    /// checkpoint and returns to awaiting input.
+    Interrupt,
 }
 
 /// Everything a frontend needs from the harness.
@@ -138,6 +148,28 @@ pub trait Frontend: Send + Sync {
     async fn run_tool(&self, agent: &AgentId, call: &ToolCall)
         -> Result<ToolOutput, FrontendError>;
 
+    /// Called by the harness when an interrupt begins. Cancels pending user
+    /// interactions, resolving any blocked `run_tool` calls (open
+    /// AskUserQuestion calls resolve as interrupted). The default does
+    /// nothing.
+    async fn interrupt(&self) -> Result<(), FrontendError> {
+        Ok(())
+    }
+
     /// Announces shutdown to clients and stops servers/IO.
     async fn shutdown(&mut self, message: Option<String>) -> Result<(), FrontendError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupt_command_wire_format() {
+        let command = FrontendCommand::Interrupt;
+        let value = serde_json::to_value(&command).unwrap();
+        assert_eq!(value, serde_json::json!({"command": "interrupt"}));
+        let parsed: FrontendCommand = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, command);
+    }
 }

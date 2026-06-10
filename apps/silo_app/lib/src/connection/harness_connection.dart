@@ -37,8 +37,9 @@ enum ConnectionStatus {
   /// Connection lost; a reconnect attempt is scheduled.
   reconnecting,
 
-  /// Authentication was rejected or no credentials are available.
-  /// No automatic reconnection.
+  /// Authentication was rejected, no credentials are available, or the
+  /// automatic retries are exhausted. No automatic reconnection until
+  /// [HarnessConnection.connect] is called again.
   failed,
 }
 
@@ -54,9 +55,11 @@ class HarnessConnection extends ChangeNotifier {
   HarnessConnection({
     required this.endpoint,
     required this._secrets,
+    required this._settings,
     ChannelFactory? channelFactory,
     this.clientName = 'silo_app',
     BackoffPolicy? backoff,
+    this.maxAutoReconnects = 5,
   })  : _channelFactory = channelFactory ?? default_channel.platformConnect,
         _backoff = backoff ?? _defaultBackoff;
 
@@ -64,16 +67,45 @@ class HarnessConnection extends ChangeNotifier {
   final String clientName;
   final EventStore store = EventStore();
 
+  /// Real secrets: the local auth token and the Ed25519 private key seed.
   final SecretStore _secrets;
+
+  /// Non-secret per-endpoint values: the pinned certificate fingerprint
+  /// and the key id assigned at pairing.
+  final SecretStore _settings;
+
   final ChannelFactory _channelFactory;
   final BackoffPolicy _backoff;
+
+  /// Automatic reconnect attempts before the connection parks in
+  /// [ConnectionStatus.failed] and waits for a manual retry.
+  final int maxAutoReconnects;
 
   MessageChannel? _channel;
   StreamSubscription<dynamic>? _subscription;
   Timer? _reconnectTimer;
+  Timer? _countdownTimer;
   int _reconnectAttempt = 0;
   bool _closing = false;
   bool _disposed = false;
+
+  /// The reconnect attempt currently scheduled or in flight, starting at 1
+  /// for the first retry. Zero outside automatic reconnection.
+  int get reconnectAttempt => _reconnectAttempt;
+
+  /// When the pending automatic retry fires. Null when none is scheduled.
+  DateTime? nextRetryAt;
+
+  /// Time until the pending automatic retry, clamped to zero. Null when
+  /// none is scheduled.
+  Duration? get nextRetryIn {
+    final at = nextRetryAt;
+    if (at == null) {
+      return null;
+    }
+    final remaining = at.difference(DateTime.now());
+    return remaining.isNegative ? Duration.zero : remaining;
+  }
 
   /// Pairing code to redeem on the next connection attempt. Cleared once
   /// pairing succeeds.
@@ -89,8 +121,36 @@ class HarnessConnection extends ChangeNotifier {
   String? lastError;
   String? harnessId;
   String? clientId;
+
+  /// Protocol version announced in the server's Hello message. Null until
+  /// the first Hello arrives.
+  int? protocolVersion;
   AccessReport? accessReport;
   List<CostEntry> costEntries = const [];
+
+  bool _showRawPayloads = false;
+
+  /// Whether the transcript renders raw payload details for this session:
+  /// suppressed tool tiles and wire identifiers. Off by default; toggled
+  /// from the connection-details sheet. Not persisted.
+  bool get showRawPayloads => _showRawPayloads;
+  set showRawPayloads(bool value) {
+    if (_showRawPayloads == value) {
+      return;
+    }
+    _showRawPayloads = value;
+    notifyListeners();
+  }
+
+  /// Display name for this harness: the endpoint name when it is not the
+  /// raw harness id, else the workspace folder name from the transcript,
+  /// else the host of the URL.
+  String get displayName => harnessDisplayName(
+        endpointName: endpoint.name,
+        workspace: store.latestWorkspace,
+        harnessId: harnessId ?? endpoint.harnessId,
+        url: endpoint.url,
+      );
 
   /// Last pairing code issued by the harness via RequestPairingCode.
   PairingCodeMessage? issuedPairingCode;
@@ -119,8 +179,23 @@ class HarnessConnection extends ChangeNotifier {
     }
   }
 
-  /// Opens the connection. Safe to call when already connected (no-op).
+  /// Opens the connection, resetting the automatic-retry budget. Safe to
+  /// call when already connected (no-op). Callers in widget lifecycles
+  /// must not call this during build: the status change notifies
+  /// listeners synchronously.
   Future<void> connect() async {
+    if (_status == ConnectionStatus.connecting ||
+        _status == ConnectionStatus.authenticating ||
+        _status == ConnectionStatus.connected) {
+      return;
+    }
+    _reconnectAttempt = 0;
+    await _connect();
+  }
+
+  /// Opens the connection without touching the retry budget; the
+  /// reconnect timer lands here.
+  Future<void> _connect() async {
     if (_status == ConnectionStatus.connecting ||
         _status == ConnectionStatus.authenticating ||
         _status == ConnectionStatus.connected) {
@@ -128,9 +203,10 @@ class HarnessConnection extends ChangeNotifier {
     }
     _closing = false;
     _reconnectTimer?.cancel();
+    _stopCountdown();
     _setStatus(ConnectionStatus.connecting);
     try {
-      final fingerprint = await _secrets.read(endpoint.fingerprintKey);
+      final fingerprint = await _settings.read(endpoint.fingerprintKey);
       final channel =
           await _channelFactory(Uri.parse(endpoint.url), fingerprint);
       _channel = channel;
@@ -150,6 +226,7 @@ class HarnessConnection extends ChangeNotifier {
   Future<void> disconnect() async {
     _closing = true;
     _reconnectTimer?.cancel();
+    _stopCountdown();
     await _subscription?.cancel();
     _subscription = null;
     await _channel?.close();
@@ -173,18 +250,38 @@ class HarnessConnection extends ChangeNotifier {
   }
 
   void _scheduleReconnect() {
+    _stopCountdown();
     if (_closing || _disposed) {
       _setStatus(ConnectionStatus.disconnected);
       return;
     }
-    _setStatus(ConnectionStatus.reconnecting);
+    if (_reconnectAttempt >= maxAutoReconnects) {
+      lastError ??= 'connection lost';
+      _setStatus(ConnectionStatus.failed);
+      return;
+    }
     final delay = _backoff(_reconnectAttempt);
     _reconnectAttempt += 1;
+    nextRetryAt = DateTime.now().add(delay);
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(delay, () {
-      _setStatus(ConnectionStatus.disconnected);
-      connect();
+      _stopCountdown();
+      _connect();
     });
+    // Refresh listeners each second so a countdown to the retry can be
+    // displayed.
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!_disposed) {
+        notifyListeners();
+      }
+    });
+    _setStatus(ConnectionStatus.reconnecting);
+  }
+
+  void _stopCountdown() {
+    _countdownTimer?.cancel();
+    _countdownTimer = null;
+    nextRetryAt = null;
   }
 
   void _send(ClientMessage message) {
@@ -215,6 +312,7 @@ class HarnessConnection extends ChangeNotifier {
     switch (message) {
       case HelloMessage():
         harnessId = message.harnessId;
+        protocolVersion = message.protocolVersion;
         _setStatus(ConnectionStatus.authenticating);
         await _startAuth();
       case AuthChallengeMessage():
@@ -272,7 +370,7 @@ class HarnessConnection extends ChangeNotifier {
       _send(AuthenticateMessage(auth: LocalTokenAuth(token: token)));
       return;
     }
-    final keyId = await _secrets.read(endpoint.keyIdKey);
+    final keyId = await _settings.read(endpoint.keyIdKey);
     final seed = await _secrets.read(endpoint.keySeedKey);
     if (keyId != null && seed != null) {
       _send(AuthenticateMessage(auth: ChallengeAuth(keyId: keyId)));
@@ -300,7 +398,7 @@ class HarnessConnection extends ChangeNotifier {
   }
 
   Future<void> _answerChallenge(String challengeB64) async {
-    final keyId = await _secrets.read(endpoint.keyIdKey);
+    final keyId = await _settings.read(endpoint.keyIdKey);
     final seed = await _secrets.read(endpoint.keySeedKey);
     if (keyId == null || seed == null) {
       lastError = 'challenge received but no stored key';
@@ -324,7 +422,7 @@ class HarnessConnection extends ChangeNotifier {
     final seed = _pendingKeySeed;
     if (seed != null && message.keyId != null) {
       await _secrets.write(endpoint.keySeedKey, base64Encode(seed));
-      await _secrets.write(endpoint.keyIdKey, message.keyId!);
+      await _settings.write(endpoint.keyIdKey, message.keyId!);
       _pendingKeySeed = null;
       pendingPairingCode = null;
     }
@@ -338,6 +436,8 @@ class HarnessConnection extends ChangeNotifier {
   // Send helpers.
 
   void sendPrompt(String text) => _send(PromptMessage(text: text));
+
+  void interrupt() => _send(const InterruptMessage());
 
   void answerQuestion(String questionId, String answer) =>
       _send(AnswerQuestionMessage(questionId: questionId, answer: answer));
@@ -356,7 +456,8 @@ class HarnessConnection extends ChangeNotifier {
 
   /// The pinned certificate fingerprint for this endpoint, if one is
   /// stored (hex SHA-256).
-  Future<String?> pinnedFingerprint() => _secrets.read(endpoint.fingerprintKey);
+  Future<String?> pinnedFingerprint() =>
+      _settings.read(endpoint.fingerprintKey);
 
   void requestShutdown() => _send(const ShutdownMessage());
 
@@ -365,6 +466,7 @@ class HarnessConnection extends ChangeNotifier {
     _disposed = true;
     _closing = true;
     _reconnectTimer?.cancel();
+    _countdownTimer?.cancel();
     _subscription?.cancel();
     _channel?.close();
     super.dispose();

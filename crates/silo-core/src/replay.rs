@@ -17,6 +17,7 @@ use crate::error::{LlmError, SandboxError};
 use crate::event::Event;
 use crate::journal::{JournalEntry, JournalRecord, NetworkRecord};
 use crate::tool::{ToolCall, ToolOutput};
+use crate::traits::FrontendCommand;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScriptedLlmTurn {
@@ -60,6 +61,11 @@ pub enum FrontendStep {
     /// content, then waits until the harness upload listener has consumed
     /// the corresponding scripted sandbox Write.
     UploadFile { name: String, content_b64: String },
+    /// The mock frontend sends `FrontendCommand::Interrupt`. Consumed while
+    /// answering an AskUserQuestion (the question resolves as interrupted)
+    /// or while supplying user input (the interrupt arrives while the
+    /// harness is idle).
+    Interrupt,
     /// The session is expected to end (Exit tool or client shutdown).
     ExpectShutdown {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,11 +300,19 @@ pub fn script_from_journal(records: &[JournalRecord], name: &str) -> TestScript 
                         .frontend
                         .push(FrontendStep::SendPrompt { text: text.clone() });
                 }
-                crate::event::EventPayload::QuestionAnswered { answer, .. } => {
-                    script.frontend.push(FrontendStep::AnswerQuestion {
-                        contains: None,
-                        answer: answer.clone(),
-                    });
+                crate::event::EventPayload::QuestionAnswered {
+                    client_id, answer, ..
+                } => {
+                    // Answers recorded when an interrupt cancels a question
+                    // are covered by the Interrupt step generated from the
+                    // journaled frontend command; only client answers
+                    // become AnswerQuestion steps.
+                    if client_id.is_some() || answer != crate::event::INTERRUPTED_ANSWER {
+                        script.frontend.push(FrontendStep::AnswerQuestion {
+                            contains: None,
+                            answer: answer.clone(),
+                        });
+                    }
                 }
                 crate::event::EventPayload::FileShared {
                     name,
@@ -317,6 +331,17 @@ pub fn script_from_journal(records: &[JournalRecord], name: &str) -> TestScript 
                 }
                 _ => {}
             },
+            JournalEntry::FrontendCommand { command } => {
+                // An interrupt is journaled as a frontend command at the
+                // point where the harness consumed it, which is where the
+                // replay re-injects it. The Interrupted event derived from
+                // the command produces no step.
+                if let Ok(FrontendCommand::Interrupt) =
+                    serde_json::from_value::<FrontendCommand>(command.clone())
+                {
+                    script.frontend.push(FrontendStep::Interrupt);
+                }
+            }
             JournalEntry::Network { record } => {
                 script.network.push(record.clone());
             }
@@ -462,6 +487,124 @@ mod tests {
                 name: "blob.bin".into(),
                 content_b64: "3q2+7w==".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn interrupt_commands_become_steps_and_derived_events_do_not() {
+        use crate::clock::Timestamp;
+        use crate::event::{Event, EventPayload, INTERRUPTED_ANSWER};
+
+        let time = Timestamp {
+            logical: 0,
+            wall_ms: None,
+        };
+        let event_record = |seq: u64, payload: EventPayload| JournalRecord {
+            seq,
+            time,
+            entry: JournalEntry::Event {
+                event: Event { seq, time, payload },
+            },
+        };
+        let command_record = |seq: u64, command: serde_json::Value| JournalRecord {
+            seq,
+            time,
+            entry: JournalEntry::FrontendCommand { command },
+        };
+        let records = vec![
+            event_record(
+                0,
+                EventPayload::UserPrompt {
+                    client_id: None,
+                    client_name: None,
+                    text: "ask me".into(),
+                },
+            ),
+            command_record(1, json!({"command": "interrupt"})),
+            // Derived from the interrupt: produces no step.
+            event_record(
+                2,
+                EventPayload::QuestionAnswered {
+                    id: "q1".into(),
+                    client_id: None,
+                    answer: INTERRUPTED_ANSWER.into(),
+                },
+            ),
+            event_record(
+                3,
+                EventPayload::Interrupted {
+                    agent: "agent-0".into(),
+                },
+            ),
+            // A real answer still becomes an AnswerQuestion step.
+            event_record(
+                4,
+                EventPayload::QuestionAnswered {
+                    id: "q2".into(),
+                    client_id: Some("c1".into()),
+                    answer: "blue".into(),
+                },
+            ),
+            // Shutdown commands map through the Shutdown event, not here.
+            command_record(5, json!({"command": "shutdown"})),
+        ];
+        let script = script_from_journal(&records, "interrupts");
+        assert_eq!(
+            script.frontend,
+            vec![
+                FrontendStep::SendPrompt {
+                    text: "ask me".into()
+                },
+                FrontendStep::Interrupt,
+                FrontendStep::AnswerQuestion {
+                    contains: None,
+                    answer: "blue".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pretty_name_fields_do_not_change_the_script() {
+        use crate::clock::Timestamp;
+        use crate::event::{Event, EventPayload};
+
+        let time = Timestamp {
+            logical: 0,
+            wall_ms: None,
+        };
+        let event_record = |seq: u64, payload: EventPayload| JournalRecord {
+            seq,
+            time,
+            entry: JournalEntry::Event {
+                event: Event { seq, time, payload },
+            },
+        };
+        let records = vec![
+            event_record(
+                0,
+                EventPayload::UserPrompt {
+                    client_id: Some("c1".into()),
+                    client_name: Some("Ian's phone".into()),
+                    text: "go".into(),
+                },
+            ),
+            event_record(
+                1,
+                EventPayload::AgentSpawned {
+                    parent: "agent-0".into(),
+                    agent: "agent-1".into(),
+                    name: Some("refactor tests".into()),
+                    prompt: "do it".into(),
+                },
+            ),
+        ];
+        let script = script_from_journal(&records, "names");
+        // The prompt step carries only the text; agent_spawned produces no
+        // step at all.
+        assert_eq!(
+            script.frontend,
+            vec![FrontendStep::SendPrompt { text: "go".into() }]
         );
     }
 

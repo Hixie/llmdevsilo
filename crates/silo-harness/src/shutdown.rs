@@ -1,4 +1,4 @@
-//! Shutdown coordination for one harness session.
+//! Shutdown and interrupt coordination for one harness session.
 //!
 //! A shutdown can be requested by a frontend command (the Exit tool or a
 //! client), by an OS signal, or by the harness itself. The first request
@@ -7,6 +7,12 @@
 //! call, and the top-level loop awaits [`ShutdownSignal::wait`] while
 //! waiting for user input, so a mid-turn request interrupts the session at
 //! the next await point.
+//!
+//! Interrupts ([`FrontendCommand::Interrupt`]) are counted in a generation
+//! watch. Each top-level turn snapshots the generation after draining the
+//! command channel; an interrupt applies to the turn when the generation
+//! grows past the snapshot, so an interrupt that arrived while the harness
+//! was idle is consumed by the snapshot and does not abort the next turn.
 
 use std::sync::Arc;
 
@@ -15,10 +21,21 @@ use tokio::sync::{mpsc, watch, Mutex};
 use silo_core::journal::{JournalEntry, JournalHandle};
 use silo_core::traits::FrontendCommand;
 
+/// Why in-progress work should stop.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AbortReason {
+    /// A shutdown was requested, with its final message.
+    Shutdown(Option<String>),
+    /// The user interrupted the turn.
+    Interrupted,
+}
+
 #[derive(Clone)]
 pub(crate) struct ShutdownSignal {
     /// `Some(message)` once a shutdown has been requested.
     state: watch::Sender<Option<Option<String>>>,
+    /// Count of interrupt commands applied so far.
+    interrupts: watch::Sender<u64>,
     /// Frontend command channel. Set to `None` once disconnected.
     commands: Arc<Mutex<Option<mpsc::Receiver<FrontendCommand>>>>,
     journal: JournalHandle,
@@ -27,8 +44,10 @@ pub(crate) struct ShutdownSignal {
 impl ShutdownSignal {
     pub fn new(commands: mpsc::Receiver<FrontendCommand>, journal: JournalHandle) -> Self {
         let (state, _) = watch::channel(None);
+        let (interrupts, _) = watch::channel(0);
         ShutdownSignal {
             state,
+            interrupts,
             commands: Arc::new(Mutex::new(Some(commands))),
             journal,
         }
@@ -54,12 +73,14 @@ impl ShutdownSignal {
         }
         match command {
             FrontendCommand::Shutdown { message } => self.request(message),
+            FrontendCommand::Interrupt => {
+                self.interrupts.send_modify(|generation| *generation += 1);
+            }
         }
     }
 
-    /// Drains any pending frontend commands, then reports whether a
-    /// shutdown has been requested (and with which message).
-    pub async fn check(&self) -> Option<Option<String>> {
+    /// Applies every queued frontend command.
+    async fn drain(&self) {
         let mut guard = self.commands.lock().await;
         let mut disconnected = false;
         if let Some(rx) = guard.as_mut() {
@@ -77,8 +98,61 @@ impl ShutdownSignal {
         if disconnected {
             *guard = None;
         }
-        drop(guard);
+    }
+
+    /// Drains any pending frontend commands, then reports whether a
+    /// shutdown has been requested (and with which message).
+    pub async fn check(&self) -> Option<Option<String>> {
+        self.drain().await;
         self.state.borrow().clone()
+    }
+
+    /// Generation of the most recent interrupt. A turn snapshots this at
+    /// its start (after a drain) and compares against it at every
+    /// checkpoint.
+    pub fn interrupt_generation(&self) -> u64 {
+        *self.interrupts.borrow()
+    }
+
+    /// True when an interrupt newer than `generation` has been applied.
+    /// Call after a drain (for example [`ShutdownSignal::check`]) so queued
+    /// commands are counted.
+    pub fn interrupted_since(&self, generation: u64) -> bool {
+        *self.interrupts.borrow() > generation
+    }
+
+    /// Waits until in-progress work should stop: a shutdown request, or an
+    /// interrupt newer than `generation`. Drains frontend commands while
+    /// waiting; a shutdown wins over a co-queued interrupt.
+    pub async fn wait_abort(&self, generation: u64) -> AbortReason {
+        let mut state_rx = self.state.subscribe();
+        let mut interrupt_rx = self.interrupts.subscribe();
+        loop {
+            self.drain().await;
+            if let Some(message) = state_rx.borrow_and_update().clone() {
+                return AbortReason::Shutdown(message);
+            }
+            if *interrupt_rx.borrow_and_update() > generation {
+                return AbortReason::Interrupted;
+            }
+            let mut guard = self.commands.lock().await;
+            if let Some(rx) = guard.as_mut() {
+                tokio::select! {
+                    _ = state_rx.changed() => {}
+                    _ = interrupt_rx.changed() => {}
+                    command = rx.recv() => match command {
+                        Some(command) => self.apply(command),
+                        None => *guard = None,
+                    }
+                }
+            } else {
+                drop(guard);
+                tokio::select! {
+                    _ = state_rx.changed() => {}
+                    _ = interrupt_rx.changed() => {}
+                }
+            }
+        }
     }
 
     /// Waits until a shutdown is requested and returns its message.
@@ -196,5 +270,54 @@ mod tests {
         assert_eq!(signal.check().await, None);
         signal.request(None);
         assert_eq!(signal.check().await, Some(None));
+    }
+
+    #[tokio::test]
+    async fn interrupt_commands_bump_the_generation() {
+        let (signal, tx) = signal_with_channel();
+        assert_eq!(signal.interrupt_generation(), 0);
+        tx.send(FrontendCommand::Interrupt).await.unwrap();
+        // An interrupt is not a shutdown.
+        assert_eq!(signal.check().await, None);
+        assert_eq!(signal.interrupt_generation(), 1);
+        assert!(signal.interrupted_since(0));
+        assert!(!signal.interrupted_since(1));
+    }
+
+    #[tokio::test]
+    async fn wait_abort_returns_interrupted_for_a_newer_generation() {
+        let (signal, tx) = signal_with_channel();
+        let waiter = signal.clone();
+        let handle = tokio::spawn(async move { waiter.wait_abort(0).await });
+        tx.send(FrontendCommand::Interrupt).await.unwrap();
+        assert_eq!(handle.await.unwrap(), AbortReason::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn wait_abort_ignores_interrupts_at_or_below_the_generation() {
+        let (signal, tx) = signal_with_channel();
+        tx.send(FrontendCommand::Interrupt).await.unwrap();
+        signal.check().await;
+        assert_eq!(signal.interrupt_generation(), 1);
+        let waiter = signal.clone();
+        let handle = tokio::spawn(async move { waiter.wait_abort(1).await });
+        tx.send(FrontendCommand::Interrupt).await.unwrap();
+        assert_eq!(handle.await.unwrap(), AbortReason::Interrupted);
+        assert_eq!(signal.interrupt_generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn wait_abort_prefers_shutdown_over_a_queued_interrupt() {
+        let (signal, tx) = signal_with_channel();
+        tx.send(FrontendCommand::Interrupt).await.unwrap();
+        tx.send(FrontendCommand::Shutdown {
+            message: Some("bye".into()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            signal.wait_abort(0).await,
+            AbortReason::Shutdown(Some("bye".into()))
+        );
     }
 }

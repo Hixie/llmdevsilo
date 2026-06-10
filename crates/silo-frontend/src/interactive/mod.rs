@@ -54,6 +54,14 @@ struct Started {
     run_file: PathBuf,
 }
 
+/// Resolution of one pending AskUserQuestion.
+enum QuestionOutcome {
+    /// A client answered.
+    Answered(String),
+    /// A user interrupt cancelled the question.
+    Interrupted,
+}
+
 /// State shared with the connection tasks.
 struct Shared {
     harness_id: String,
@@ -67,9 +75,9 @@ struct Shared {
     token_digest: [u8; 32],
     keys: Mutex<auth::AuthorizedKeys>,
     pairing: Mutex<auth::PairingCodes>,
-    /// Pending AskUserQuestion calls by question id. The first answer
-    /// removes the entry.
-    questions: Mutex<HashMap<String, oneshot::Sender<String>>>,
+    /// Pending AskUserQuestion calls by question id. The first answer (or
+    /// an interrupt) removes the entry.
+    questions: Mutex<HashMap<String, oneshot::Sender<QuestionOutcome>>>,
     /// Latest CostReport per backend, maintained by the cost watcher task.
     cost: Mutex<BTreeMap<String, CostEntry>>,
     prompt_tx: mpsc::UnboundedSender<String>,
@@ -246,7 +254,10 @@ impl Frontend for InteractiveFrontend {
                 });
                 tokio::select! {
                     answer = answer_rx => match answer {
-                        Ok(answer) => Ok(ToolOutput::ok(answer)),
+                        Ok(QuestionOutcome::Answered(answer)) => Ok(ToolOutput::ok(answer)),
+                        Ok(QuestionOutcome::Interrupted) => {
+                            Ok(ToolOutput::error(silo_core::tool::INTERRUPTED_BY_USER))
+                        }
                         Err(_) => Err(FrontendError::Closed(
                             "the question was cancelled by shutdown".into(),
                         )),
@@ -277,6 +288,31 @@ impl Frontend for InteractiveFrontend {
             }
             other => Ok(ToolOutput::error(format!("unknown frontend tool: {other}"))),
         }
+    }
+
+    /// Resolves every pending question as interrupted and emits a
+    /// QuestionAnswered event for each, so all clients drop the question
+    /// UI. The blocked AskUserQuestion calls return the interrupted tool
+    /// result.
+    async fn interrupt(&self) -> Result<(), FrontendError> {
+        let started = self.require_started()?;
+        let shared = &started.shared;
+        let pending: Vec<(String, oneshot::Sender<QuestionOutcome>)> = shared
+            .questions
+            .lock()
+            .expect("questions poisoned")
+            .drain()
+            .collect();
+        for (id, sender) in pending {
+            if sender.send(QuestionOutcome::Interrupted).is_ok() {
+                shared.bus.emit(EventPayload::QuestionAnswered {
+                    id,
+                    client_id: None,
+                    answer: silo_core::event::INTERRUPTED_ANSWER.into(),
+                });
+            }
+        }
+        Ok(())
     }
 
     async fn shutdown(&mut self, message: Option<String>) -> Result<(), FrontendError> {

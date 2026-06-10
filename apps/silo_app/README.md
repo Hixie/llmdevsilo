@@ -83,6 +83,20 @@ app probes.
    connections authenticate by signing a server-issued challenge; the
    pairing code is never needed again.
 
+## How the app stores its data (and macOS keychain prompts)
+
+Only real secrets — local auth tokens and pairing private keys — go in the
+platform keystore, and they are consolidated into a single keychain item
+(`silo/secrets`) holding one JSON document. Everything non-secret — the
+endpoint list, pinned certificate fingerprints, key ids, the silo binary
+path, and the last launch form — lives in a plain JSON preferences file in
+the application support directory. One keychain item means at most one
+keychain prompt per run, and the item is read lazily: only when a flow
+actually needs a secret (connecting to an endpoint, pairing), never before
+the first frame is on screen. On first launch after upgrading, values left
+in the old layout (one keychain item per key) are migrated into the new
+one and the old items are deleted; the migration tolerates denied reads.
+
 On macOS the app stores secrets in the legacy login keychain
 (`useDataProtectionKeyChain: false` in `lib/src/connection/secret_store.dart`).
 The modern data-protection keychain needs the `keychain-access-groups`
@@ -92,6 +106,13 @@ macos` needs no Apple developer account. Projects that adopt development
 signing can add the entitlement and flip the option back. If the keystore
 ever rejects operations anyway, the app keeps settings in memory for the
 session and logs the failure instead of crashing.
+
+Note on prompts under ad-hoc signing: macOS ties a keychain item's "Always
+Allow" grant to the requesting binary's code signature. Flutter's default
+debug builds are ad-hoc signed, and the signature changes on every
+rebuild, so macOS forgets the grant and asks again — one prompt per
+rebuild is expected in that setup. Real development signing gives the app
+a stable identity, and the grant then sticks across rebuilds.
 
 ## TLS and certificate pinning
 
@@ -118,9 +139,9 @@ Per the project design, all code in a harness workspace is assumed to be or
 become open source: there are no secrets in the workspace, credentials
 exposed to the model are temporary development credentials, and production
 data is never attached to a harness. The app stores its own secrets (local
-tokens, pairing private keys, pinned certificate fingerprints) in the
-platform keystore via `flutter_secure_storage`, and never sends them
-anywhere except the harness they belong to.
+tokens and pairing private keys) in the platform keystore via
+`flutter_secure_storage`, and never sends them anywhere except the harness
+they belong to.
 
 On macOS the app runs without the App Sandbox so it can read run files and
 spawn local harnesses; see `macos/Runner/README.md`.

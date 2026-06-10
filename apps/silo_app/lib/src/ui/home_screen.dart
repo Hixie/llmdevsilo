@@ -71,8 +71,11 @@ class HomeScreen extends StatelessWidget {
               onPressed: () => Navigator.of(context).pop(run),
               child: ListTile(
                 contentPadding: EdgeInsets.zero,
-                title: Text(run.workspace),
-                subtitle: Text('${run.harnessId} · ${run.addr}'),
+                title: Text(harnessDisplayName(
+                  workspace: run.workspace,
+                  url: 'wss://${run.addr}',
+                )),
+                subtitle: Text('${run.workspace} · ${run.addr}'),
               ),
             ),
         ],
@@ -92,15 +95,16 @@ class HomeScreen extends StatelessWidget {
     final messenger = ScaffoldMessenger.of(context);
     try {
       final token = await local.readLocalToken(run);
-      final name = run.workspace.split('/').lastWhere(
-            (part) => part.isNotEmpty,
-            orElse: () => run.harnessId,
-          );
+      final name = harnessDisplayName(
+        workspace: run.workspace,
+        url: 'wss://${run.addr}',
+      );
       final connection = await registry.addLocal(
         name: name,
         url: 'wss://${run.addr}',
         token: token,
         fingerprintSha256: run.certFingerprintSha256,
+        harnessId: run.harnessId,
       );
       if (context.mounted) {
         _openChat(context, connection);
@@ -329,10 +333,14 @@ class _HarnessTile extends StatelessWidget {
               Colors.orange,
               'Authenticating…'
             ),
-          ConnectionStatus.reconnecting => (Colors.orange, 'Reconnecting…'),
+          ConnectionStatus.reconnecting => (
+              Colors.orange,
+              'Reconnecting (attempt ${connection.reconnectAttempt} of '
+                  '${connection.maxAutoReconnects})…'
+            ),
           ConnectionStatus.failed => (
               scheme.error,
-              connection.lastError ?? 'Authentication failed'
+              'Failed: ${connection.lastError ?? 'authentication rejected'}'
             ),
           ConnectionStatus.disconnected => (scheme.outline, 'Not connected'),
         };
@@ -346,7 +354,7 @@ class _HarnessTile extends StatelessWidget {
               child: Icon(Icons.hub_outlined, color: color),
             ),
           ),
-          title: Text(endpoint.name),
+          title: Text(connection.displayName),
           subtitle: Text(
             '${endpoint.url} · $label',
             maxLines: 1,

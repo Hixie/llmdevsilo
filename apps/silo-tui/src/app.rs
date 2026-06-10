@@ -40,6 +40,8 @@ pub enum ItemKind {
     FileNote,
     /// Harness lifecycle and informational notes, dim.
     System,
+    /// Interrupt notice, dim red.
+    Interrupted,
     /// Errors, red.
     Error,
     /// Shutdown notice, bold red.
@@ -50,6 +52,9 @@ pub enum ItemKind {
 pub struct TranscriptItem {
     pub kind: ItemKind,
     pub text: String,
+    /// Raw ids behind this line (agent ids, tool_use ids, client ids).
+    /// Rendered in dim brackets when debug mode is on.
+    pub debug: Option<String>,
 }
 
 impl TranscriptItem {
@@ -57,6 +62,15 @@ impl TranscriptItem {
         TranscriptItem {
             kind,
             text: text.into(),
+            debug: None,
+        }
+    }
+
+    fn with_debug(kind: ItemKind, text: impl Into<String>, debug: impl Into<String>) -> Self {
+        TranscriptItem {
+            kind,
+            text: text.into(),
+            debug: Some(debug.into()),
         }
     }
 }
@@ -128,12 +142,32 @@ fn is_top_level(agent: &str) -> bool {
     agent == "agent-0"
 }
 
+/// Last path component of a workspace path, used to identify the harness.
+pub fn workspace_folder_name(workspace: &str) -> String {
+    std::path::Path::new(workspace)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.to_string())
+}
+
+/// Display label for a subagent: "subagent {name}" when the Agent tool
+/// gave one, else "subagent {ordinal}" derived from the agent id.
+pub fn subagent_label(agent: &str, names: &BTreeMap<String, String>) -> String {
+    if let Some(name) = names.get(agent) {
+        return format!("subagent {name}");
+    }
+    match agent.strip_prefix("agent-") {
+        Some(ordinal) => format!("subagent {ordinal}"),
+        None => format!("subagent {agent}"),
+    }
+}
+
 /// Indentation and label applied to lines from subagents.
-fn agent_prefix(agent: &str) -> String {
+fn agent_prefix(agent: &str, names: &BTreeMap<String, String>) -> String {
     if is_top_level(agent) {
         String::new()
     } else {
-        format!("  [{agent}] ")
+        format!("  [{}] ", subagent_label(agent, names))
     }
 }
 
@@ -145,58 +179,95 @@ fn b64_decoded_len(content_b64: &str) -> usize {
 
 /// Maps one event payload to zero or more transcript entries. Cost reports
 /// and idle markers feed the status bar instead and produce nothing here.
-pub fn transcript_items(payload: &EventPayload) -> Vec<TranscriptItem> {
+/// `names` maps subagent ids to their given names. Raw ids (agent ids,
+/// tool_use ids, client ids) go into the items' debug field, shown only in
+/// debug mode.
+pub fn transcript_items(
+    payload: &EventPayload,
+    names: &BTreeMap<String, String>,
+) -> Vec<TranscriptItem> {
     match payload {
         EventPayload::HarnessStarted {
             harness_id,
             workspace,
             sandbox,
             llm,
-        } => vec![TranscriptItem::new(
+        } => vec![TranscriptItem::with_debug(
             ItemKind::System,
-            format!("harness {harness_id} started · workspace {workspace} · sandbox {sandbox} · llm {llm}"),
+            format!(
+                "harness {} started · workspace {workspace} · sandbox {sandbox} · llm {llm}",
+                workspace_folder_name(workspace)
+            ),
+            harness_id.clone(),
         )],
-        EventPayload::UserPrompt { client_id, text } => {
-            let client = client_id.as_deref().unwrap_or("client");
-            vec![TranscriptItem::new(
-                ItemKind::Prompt,
-                format!("{client} > {text}"),
-            )]
+        EventPayload::UserPrompt {
+            client_id,
+            client_name,
+            text,
+        } => {
+            let line = match client_name {
+                Some(name) => format!("{name} > {text}"),
+                None => format!("> {text}"),
+            };
+            vec![match client_id {
+                Some(id) => TranscriptItem::with_debug(ItemKind::Prompt, line, id.clone()),
+                None => TranscriptItem::new(ItemKind::Prompt, line),
+            }]
         }
-        EventPayload::AssistantText { agent, text } => vec![TranscriptItem::new(
+        EventPayload::AssistantText { agent, text } => vec![TranscriptItem::with_debug(
             ItemKind::Assistant,
-            format!("{}{text}", agent_prefix(agent)),
+            format!("{}{text}", agent_prefix(agent, names)),
+            agent.clone(),
         )],
         EventPayload::ToolUse { agent, call } => {
             let summary = compact_input_summary(&call.input);
             let text = if summary.is_empty() {
-                format!("{}{}", agent_prefix(agent), call.name)
+                format!("{}{}", agent_prefix(agent, names), call.name)
             } else {
-                format!("{}{} {summary}", agent_prefix(agent), call.name)
+                format!("{}{} {summary}", agent_prefix(agent, names), call.name)
             };
-            vec![TranscriptItem::new(ItemKind::ToolUse, text)]
+            vec![TranscriptItem::with_debug(
+                ItemKind::ToolUse,
+                text,
+                format!("{agent} {}", call.id),
+            )]
         }
         EventPayload::ToolResult {
             agent,
+            tool_use_id,
             tool_name,
             output,
-            ..
         } => {
             let body = truncate_block(&output.content, TOOL_RESULT_MAX_LINES);
             let text = if output.is_error {
-                format!("{}{} error: {}", agent_prefix(agent), tool_name, body)
+                format!(
+                    "{}{} error: {}",
+                    agent_prefix(agent, names),
+                    tool_name,
+                    body
+                )
             } else {
-                format!("{}{} -> {}", agent_prefix(agent), tool_name, body)
+                format!("{}{} -> {}", agent_prefix(agent, names), tool_name, body)
             };
-            vec![TranscriptItem::new(ItemKind::ToolResult, text)]
+            vec![TranscriptItem::with_debug(
+                ItemKind::ToolResult,
+                text,
+                format!("{agent} {tool_use_id}"),
+            )]
         }
         EventPayload::AgentSpawned {
             parent,
             agent,
+            name: _,
             prompt,
-        } => vec![TranscriptItem::new(
+        } => vec![TranscriptItem::with_debug(
             ItemKind::AgentNote,
-            format!("  [{agent}] spawned by {parent}: {}", one_liner(prompt)),
+            format!(
+                "  [{}] spawned: {}",
+                subagent_label(agent, names),
+                one_liner(prompt)
+            ),
+            format!("{agent}, parent {parent}"),
         )],
         EventPayload::AgentCompleted {
             agent,
@@ -204,29 +275,45 @@ pub fn transcript_items(payload: &EventPayload) -> Vec<TranscriptItem> {
             is_error,
         } => {
             let verb = if *is_error { "failed" } else { "completed" };
-            vec![TranscriptItem::new(
+            vec![TranscriptItem::with_debug(
                 ItemKind::AgentNote,
-                format!("  [{agent}] {verb}: {}", one_liner(result)),
+                format!(
+                    "  [{}] {verb}: {}",
+                    subagent_label(agent, names),
+                    one_liner(result)
+                ),
+                agent.clone(),
             )]
         }
         EventPayload::QuestionAsked {
-            agent, question, ..
+            id,
+            agent,
+            question,
         } => {
-            let mut text = format!("{}? {}", agent_prefix(agent), question.question);
+            let mut text = format!("{}? {}", agent_prefix(agent, names), question.question);
             if !question.options.is_empty() {
-                let labels: Vec<&str> =
-                    question.options.iter().map(|o| o.label.as_str()).collect();
+                let labels: Vec<&str> = question.options.iter().map(|o| o.label.as_str()).collect();
                 text.push_str(&format!(" [{}]", labels.join(" / ")));
             }
-            vec![TranscriptItem::new(ItemKind::Question, text)]
+            vec![TranscriptItem::with_debug(
+                ItemKind::Question,
+                text,
+                format!("{agent} {id}"),
+            )]
         }
         EventPayload::QuestionAnswered {
-            client_id, answer, ..
+            id,
+            client_id,
+            answer,
         } => {
-            let client = client_id.as_deref().unwrap_or("client");
-            vec![TranscriptItem::new(
+            let debug = match client_id {
+                Some(client) => format!("{id} by {client}"),
+                None => id.clone(),
+            };
+            vec![TranscriptItem::with_debug(
                 ItemKind::Answer,
-                format!("answered by {client}: {answer}"),
+                format!("answered: {answer}"),
+                debug,
             )]
         }
         EventPayload::FileShared {
@@ -235,18 +322,34 @@ pub fn transcript_items(payload: &EventPayload) -> Vec<TranscriptItem> {
             origin,
         } => {
             let bytes = b64_decoded_len(content_b64);
-            let text = match origin {
-                silo_core::event::FileOrigin::Client { client_id } => {
-                    format!("file {name} ({bytes} bytes) uploaded by {client_id}")
-                }
+            let item = match origin {
+                silo_core::event::FileOrigin::Client { client_id } => TranscriptItem::with_debug(
+                    ItemKind::FileNote,
+                    format!("file {name} ({bytes} bytes) uploaded"),
+                    client_id.clone(),
+                ),
                 silo_core::event::FileOrigin::Llm { agent } => {
-                    format!("file {name} ({bytes} bytes) sent by {agent}")
+                    let sender = if is_top_level(agent) {
+                        "the assistant".to_string()
+                    } else {
+                        subagent_label(agent, names)
+                    };
+                    TranscriptItem::with_debug(
+                        ItemKind::FileNote,
+                        format!("file {name} ({bytes} bytes) sent by {sender}"),
+                        agent.clone(),
+                    )
                 }
             };
-            vec![TranscriptItem::new(ItemKind::FileNote, text)]
+            vec![item]
         }
         EventPayload::CostReport { .. } => vec![],
         EventPayload::TurnComplete { .. } => vec![],
+        EventPayload::Interrupted { agent } => vec![TranscriptItem::with_debug(
+            ItemKind::Interrupted,
+            "■ interrupted by the user",
+            agent.clone(),
+        )],
         EventPayload::AwaitingInput => vec![],
         EventPayload::AccessReportUpdated { .. } => vec![TranscriptItem::new(
             ItemKind::System,
@@ -265,6 +368,30 @@ pub fn transcript_items(payload: &EventPayload) -> Vec<TranscriptItem> {
         }
     }
 }
+
+/// Busy state implied by one event: `Some(true)` for events that show the
+/// model working, `Some(false)` for events that return the harness to
+/// idle, `None` for events that carry no busy information.
+pub fn busy_after(payload: &EventPayload) -> Option<bool> {
+    match payload {
+        EventPayload::UserPrompt { .. }
+        | EventPayload::AssistantText { .. }
+        | EventPayload::ToolUse { .. }
+        | EventPayload::ToolResult { .. }
+        | EventPayload::AgentSpawned { .. }
+        | EventPayload::AgentCompleted { .. }
+        | EventPayload::QuestionAsked { .. }
+        | EventPayload::QuestionAnswered { .. } => Some(true),
+        EventPayload::AwaitingInput
+        | EventPayload::Interrupted { .. }
+        | EventPayload::Shutdown { .. } => Some(false),
+        _ => None,
+    }
+}
+
+/// Spinner frames for the busy indicator; the frame advances on each
+/// received event, not on a timer.
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Formats a number of tokens for the status bar, e.g. "45.6k".
 pub fn format_tokens(tokens: u64) -> String {
@@ -321,20 +448,34 @@ pub enum Popup {
         addr: String,
         fingerprint: String,
     },
+    /// Command list; the content renders from `commands::COMMANDS`.
+    Help,
 }
 
 pub struct App {
+    /// Raw harness id, shown only in debug mode.
     pub harness_id: String,
     /// Server address, shown in the pairing popup.
     pub addr: String,
     /// Pinned certificate fingerprint, shown in the pairing popup.
     pub fingerprint: String,
+    /// Workspace path, from the run file or the harness_started event.
+    pub workspace: Option<String>,
     pub conn: ConnState,
     pub transcript: Vec<TranscriptItem>,
     pub last_seq: Option<u64>,
     pub awaiting_input: bool,
+    /// True while the model is working, derived from the event stream.
+    pub busy: bool,
+    /// Spinner frame index; advances with each applied event.
+    pub spinner_frame: usize,
     /// Latest usage snapshot per backend.
     pub costs: BTreeMap<String, UsageSnapshot>,
+    /// Subagent names from agent_spawned events, keyed by agent id.
+    pub agent_names: BTreeMap<String, String>,
+    /// Debug mode: raw ids in the status bar and transcript. Per-session,
+    /// never persisted.
+    pub debug: bool,
     pub input: String,
     /// Cursor position in the input line, as a character index.
     pub cursor: usize,
@@ -350,16 +491,21 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(harness_id: String, addr: String, fingerprint: String) -> Self {
+    pub fn new(addr: String, fingerprint: String, workspace: Option<String>) -> Self {
         App {
-            harness_id,
+            harness_id: String::new(),
             addr,
             fingerprint,
+            workspace,
             conn: ConnState::Connecting { attempt: 0 },
             transcript: Vec::new(),
             last_seq: None,
             awaiting_input: false,
+            busy: false,
+            spinner_frame: 0,
             costs: BTreeMap::new(),
+            agent_names: BTreeMap::new(),
+            debug: false,
             input: String::new(),
             cursor: 0,
             question: None,
@@ -370,8 +516,22 @@ impl App {
         }
     }
 
+    /// Label identifying the harness: the workspace folder name when
+    /// known, else the server address.
+    pub fn harness_label(&self) -> String {
+        match &self.workspace {
+            Some(workspace) => workspace_folder_name(workspace),
+            None => self.addr.clone(),
+        }
+    }
+
     fn push(&mut self, kind: ItemKind, text: impl Into<String>) {
         self.transcript.push(TranscriptItem::new(kind, text));
+    }
+
+    /// Current spinner character for the busy indicator.
+    pub fn spinner_char(&self) -> char {
+        SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
     }
 
     pub fn handle_net(&mut self, event: NetEvent) {
@@ -441,6 +601,7 @@ impl App {
                     reason: "harness shut down".into(),
                 };
                 self.question = None;
+                self.busy = false;
             }
             // Hello and the authentication exchange are consumed by the
             // connection task; a heartbeat reply needs no handling.
@@ -462,7 +623,26 @@ impl App {
             }
         }
         self.last_seq = Some(event.seq);
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        if let Some(busy) = busy_after(&event.payload) {
+            self.busy = busy;
+        }
         match &event.payload {
+            EventPayload::HarnessStarted {
+                harness_id,
+                workspace,
+                ..
+            } => {
+                self.harness_id = harness_id.clone();
+                self.workspace = Some(workspace.clone());
+            }
+            EventPayload::AgentSpawned {
+                agent,
+                name: Some(name),
+                ..
+            } => {
+                self.agent_names.insert(agent.clone(), name.clone());
+            }
             EventPayload::QuestionAsked {
                 id,
                 agent,
@@ -498,7 +678,8 @@ impl App {
             }
             _ => {}
         }
-        self.transcript.extend(transcript_items(&event.payload));
+        self.transcript
+            .extend(transcript_items(&event.payload, &self.agent_names));
     }
 
     /// Handles one key press. Returns the messages to send to the server.
@@ -531,6 +712,7 @@ impl App {
                 self.scroll_from_bottom = 0;
                 vec![]
             }
+            KeyCode::Esc if self.busy => vec![ClientMessage::Interrupt],
             KeyCode::Enter => self.submit_input(),
             KeyCode::Left => {
                 self.cursor = self.cursor.saturating_sub(1);
@@ -685,6 +867,22 @@ impl App {
 
     fn run_command(&mut self, command: SlashCommand) -> Vec<ClientMessage> {
         match command {
+            SlashCommand::Help => {
+                self.clear_input();
+                self.popup = Some(Popup::Help);
+                vec![]
+            }
+            SlashCommand::Debug => {
+                self.clear_input();
+                self.debug = !self.debug;
+                let note = if self.debug {
+                    "debug mode on: raw ids are shown"
+                } else {
+                    "debug mode off"
+                };
+                self.push(ItemKind::System, note);
+                vec![]
+            }
             SlashCommand::Access => {
                 self.clear_input();
                 vec![ClientMessage::RequestAccessReport]
@@ -696,6 +894,11 @@ impl App {
             SlashCommand::Pair => {
                 self.clear_input();
                 vec![ClientMessage::RequestPairingCode]
+            }
+            SlashCommand::Stop => {
+                self.clear_input();
+                self.push(ItemKind::System, "interrupt requested");
+                vec![ClientMessage::Interrupt]
             }
             SlashCommand::Quit => {
                 self.should_quit = true;
@@ -774,7 +977,12 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new("h1".into(), "127.0.0.1:7777".into(), "ab".repeat(32))
+        App::new("127.0.0.1:7777".into(), "ab".repeat(32), None)
+    }
+
+    /// Transcript mapping with no known subagent names.
+    fn items(payload: &EventPayload) -> Vec<TranscriptItem> {
+        transcript_items(payload, &BTreeMap::new())
     }
 
     fn question(options: &[&str], multi: bool, free: bool) -> UserQuestion {
@@ -795,68 +1003,91 @@ mod tests {
     // --- transcript mapping, one test per payload variant ---
 
     #[test]
-    fn maps_harness_started() {
-        let items = transcript_items(&EventPayload::HarnessStarted {
-            harness_id: "h1".into(),
-            workspace: "/ws".into(),
+    fn maps_harness_started_with_the_workspace_folder_name() {
+        let mapped = items(&EventPayload::HarnessStarted {
+            harness_id: "deadbeef42".into(),
+            workspace: "/home/user/projects/myproject".into(),
             sandbox: "mock".into(),
             llm: "mock".into(),
         });
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, ItemKind::System);
-        assert!(items[0].text.contains("h1"));
-        assert!(items[0].text.contains("/ws"));
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].kind, ItemKind::System);
+        assert!(mapped[0].text.contains("harness myproject started"));
+        assert!(mapped[0].text.contains("/home/user/projects/myproject"));
+        // The hex id only appears in the debug field.
+        assert!(!mapped[0].text.contains("deadbeef42"));
+        assert_eq!(mapped[0].debug.as_deref(), Some("deadbeef42"));
     }
 
     #[test]
-    fn maps_user_prompt_with_client_prefix() {
-        let items = transcript_items(&EventPayload::UserPrompt {
+    fn maps_user_prompt_with_client_name_when_present() {
+        let named = items(&EventPayload::UserPrompt {
             client_id: Some("client-3".into()),
+            client_name: Some("Ian's phone".into()),
             text: "do the thing".into(),
         });
-        assert_eq!(
-            items,
-            vec![TranscriptItem::new(
-                ItemKind::Prompt,
-                "client-3 > do the thing"
-            )]
-        );
+        assert_eq!(named[0].kind, ItemKind::Prompt);
+        assert_eq!(named[0].text, "Ian's phone > do the thing");
+        assert!(!named[0].text.contains("client-3"));
+        assert_eq!(named[0].debug.as_deref(), Some("client-3"));
 
-        let anonymous = transcript_items(&EventPayload::UserPrompt {
-            client_id: None,
+        let unnamed = items(&EventPayload::UserPrompt {
+            client_id: Some("client-3".into()),
+            client_name: None,
             text: "hi".into(),
         });
-        assert_eq!(anonymous[0].text, "client > hi");
+        assert_eq!(unnamed[0].text, "> hi");
+
+        let anonymous = items(&EventPayload::UserPrompt {
+            client_id: None,
+            client_name: None,
+            text: "hi".into(),
+        });
+        assert_eq!(anonymous[0].text, "> hi");
+        assert_eq!(anonymous[0].debug, None);
     }
 
     #[test]
     fn maps_assistant_text_with_subagent_indent() {
-        let top = transcript_items(&EventPayload::AssistantText {
+        let top = items(&EventPayload::AssistantText {
             agent: "agent-0".into(),
             text: "hello".into(),
         });
         assert_eq!(top[0].kind, ItemKind::Assistant);
         assert_eq!(top[0].text, "hello");
+        assert_eq!(top[0].debug.as_deref(), Some("agent-0"));
 
-        let sub = transcript_items(&EventPayload::AssistantText {
+        let sub = items(&EventPayload::AssistantText {
             agent: "agent-2".into(),
             text: "working".into(),
         });
-        assert_eq!(sub[0].text, "  [agent-2] working");
+        assert_eq!(sub[0].text, "  [subagent 2] working");
+
+        let mut names = BTreeMap::new();
+        names.insert("agent-2".to_string(), "refactor tests".to_string());
+        let named = transcript_items(
+            &EventPayload::AssistantText {
+                agent: "agent-2".into(),
+                text: "working".into(),
+            },
+            &names,
+        );
+        assert_eq!(named[0].text, "  [subagent refactor tests] working");
     }
 
     #[test]
-    fn maps_tool_use_to_compact_one_liner() {
-        let items = transcript_items(&EventPayload::ToolUse {
+    fn maps_tool_use_to_compact_one_liner_without_ids() {
+        let mapped = items(&EventPayload::ToolUse {
             agent: "agent-0".into(),
             call: ToolCall {
-                id: "t1".into(),
+                id: "toolu_xyz".into(),
                 name: "Bash".into(),
                 input: serde_json::json!({"command": "ls -la", "timeout_ms": 500}),
             },
         });
-        assert_eq!(items[0].kind, ItemKind::ToolUse);
-        assert_eq!(items[0].text, "Bash command: ls -la");
+        assert_eq!(mapped[0].kind, ItemKind::ToolUse);
+        assert_eq!(mapped[0].text, "Bash command: ls -la");
+        assert_eq!(mapped[0].debug.as_deref(), Some("agent-0 toolu_xyz"));
     }
 
     #[test]
@@ -865,60 +1096,85 @@ mod tests {
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let items = transcript_items(&EventPayload::ToolResult {
+        let mapped = items(&EventPayload::ToolResult {
             agent: "agent-0".into(),
             tool_use_id: "t1".into(),
             tool_name: "Bash".into(),
             output: ToolOutput::ok(long),
         });
-        assert_eq!(items[0].kind, ItemKind::ToolResult);
-        assert!(items[0].text.contains("line0"));
-        assert!(items[0].text.contains("(+6 more lines)"));
-        assert!(!items[0].text.contains("line9"));
+        assert_eq!(mapped[0].kind, ItemKind::ToolResult);
+        assert!(mapped[0].text.contains("line0"));
+        assert!(mapped[0].text.contains("(+6 more lines)"));
+        assert!(!mapped[0].text.contains("line9"));
+        assert!(!mapped[0].text.contains("t1"));
+        assert_eq!(mapped[0].debug.as_deref(), Some("agent-0 t1"));
     }
 
     #[test]
     fn maps_tool_result_error() {
-        let items = transcript_items(&EventPayload::ToolResult {
+        let mapped = items(&EventPayload::ToolResult {
             agent: "agent-0".into(),
             tool_use_id: "t1".into(),
             tool_name: "Read".into(),
             output: ToolOutput::error("no such file"),
         });
-        assert!(items[0].text.contains("Read error: no such file"));
+        assert!(mapped[0].text.contains("Read error: no such file"));
     }
 
     #[test]
-    fn maps_agent_spawned_and_completed() {
-        let spawned = transcript_items(&EventPayload::AgentSpawned {
-            parent: "agent-0".into(),
-            agent: "agent-1".into(),
-            prompt: "explore the\ncodebase".into(),
-        });
+    fn maps_agent_spawned_and_completed_with_names_or_ordinals() {
+        let mut names = BTreeMap::new();
+        names.insert("agent-1".to_string(), "refactor tests".to_string());
+
+        let spawned = transcript_items(
+            &EventPayload::AgentSpawned {
+                parent: "agent-0".into(),
+                agent: "agent-1".into(),
+                name: Some("refactor tests".into()),
+                prompt: "explore the\ncodebase".into(),
+            },
+            &names,
+        );
         assert_eq!(spawned[0].kind, ItemKind::AgentNote);
         assert_eq!(
             spawned[0].text,
-            "  [agent-1] spawned by agent-0: explore the codebase"
+            "  [subagent refactor tests] spawned: explore the codebase"
+        );
+        assert_eq!(spawned[0].debug.as_deref(), Some("agent-1, parent agent-0"));
+
+        let completed = transcript_items(
+            &EventPayload::AgentCompleted {
+                agent: "agent-1".into(),
+                result: "done".into(),
+                is_error: false,
+            },
+            &names,
+        );
+        assert_eq!(
+            completed[0].text,
+            "  [subagent refactor tests] completed: done"
         );
 
-        let completed = transcript_items(&EventPayload::AgentCompleted {
-            agent: "agent-1".into(),
-            result: "done".into(),
-            is_error: false,
+        // Without a name, the label is a neutral ordinal — never agent-N.
+        let unnamed = items(&EventPayload::AgentSpawned {
+            parent: "agent-0".into(),
+            agent: "agent-2".into(),
+            name: None,
+            prompt: "look around".into(),
         });
-        assert_eq!(completed[0].text, "  [agent-1] completed: done");
+        assert_eq!(unnamed[0].text, "  [subagent 2] spawned: look around");
 
-        let failed = transcript_items(&EventPayload::AgentCompleted {
-            agent: "agent-1".into(),
+        let failed = items(&EventPayload::AgentCompleted {
+            agent: "agent-2".into(),
             result: "oops".into(),
             is_error: true,
         });
-        assert!(failed[0].text.contains("failed: oops"));
+        assert_eq!(failed[0].text, "  [subagent 2] failed: oops");
     }
 
     #[test]
     fn maps_question_asked_and_answered() {
-        let asked = transcript_items(&EventPayload::QuestionAsked {
+        let asked = items(&EventPayload::QuestionAsked {
             id: "q1".into(),
             agent: "agent-0".into(),
             question: question(&["yes", "no"], false, false),
@@ -927,18 +1183,20 @@ mod tests {
         assert!(asked[0].text.contains("Pick one"));
         assert!(asked[0].text.contains("[yes / no]"));
 
-        let answered = transcript_items(&EventPayload::QuestionAnswered {
+        let answered = items(&EventPayload::QuestionAnswered {
             id: "q1".into(),
             client_id: Some("client-9".into()),
             answer: "yes".into(),
         });
         assert_eq!(answered[0].kind, ItemKind::Answer);
-        assert_eq!(answered[0].text, "answered by client-9: yes");
+        assert_eq!(answered[0].text, "answered: yes");
+        assert!(!answered[0].text.contains("client-9"));
+        assert_eq!(answered[0].debug.as_deref(), Some("q1 by client-9"));
     }
 
     #[test]
     fn maps_file_shared_from_client_and_llm() {
-        let upload = transcript_items(&EventPayload::FileShared {
+        let upload = items(&EventPayload::FileShared {
             name: "a.txt".into(),
             content_b64: b64(b"12345"),
             origin: FileOrigin::Client {
@@ -946,55 +1204,85 @@ mod tests {
             },
         });
         assert_eq!(upload[0].kind, ItemKind::FileNote);
-        assert_eq!(upload[0].text, "file a.txt (5 bytes) uploaded by client-1");
+        assert_eq!(upload[0].text, "file a.txt (5 bytes) uploaded");
+        assert_eq!(upload[0].debug.as_deref(), Some("client-1"));
 
-        let sent = transcript_items(&EventPayload::FileShared {
+        let sent = items(&EventPayload::FileShared {
             name: "b.bin".into(),
             content_b64: b64(b"123"),
             origin: FileOrigin::Llm {
                 agent: "agent-0".into(),
             },
         });
-        assert_eq!(sent[0].text, "file b.bin (3 bytes) sent by agent-0");
+        assert_eq!(sent[0].text, "file b.bin (3 bytes) sent by the assistant");
+
+        let sent_by_sub = items(&EventPayload::FileShared {
+            name: "c.bin".into(),
+            content_b64: b64(b"123"),
+            origin: FileOrigin::Llm {
+                agent: "agent-3".into(),
+            },
+        });
+        assert_eq!(
+            sent_by_sub[0].text,
+            "file c.bin (3 bytes) sent by subagent 3"
+        );
+    }
+
+    #[test]
+    fn maps_interrupted_to_a_dim_red_notice() {
+        let mapped = items(&EventPayload::Interrupted {
+            agent: "agent-0".into(),
+        });
+        assert_eq!(mapped[0].kind, ItemKind::Interrupted);
+        assert_eq!(mapped[0].text, "■ interrupted by the user");
     }
 
     #[test]
     fn cost_turn_complete_and_awaiting_produce_no_transcript() {
-        assert!(transcript_items(&EventPayload::CostReport {
+        assert!(items(&EventPayload::CostReport {
             backend: "mock".into(),
             usage: UsageSnapshot::default(),
             quota: QuotaConfig::default(),
         })
         .is_empty());
-        assert!(transcript_items(&EventPayload::TurnComplete {
+        assert!(items(&EventPayload::TurnComplete {
             agent: "agent-0".into(),
             stop_reason: silo_core::conversation::StopReason::EndTurn,
         })
         .is_empty());
-        assert!(transcript_items(&EventPayload::AwaitingInput).is_empty());
+        assert!(items(&EventPayload::AwaitingInput).is_empty());
     }
 
     #[test]
     fn maps_access_report_updated_error_and_shutdown() {
-        let access = transcript_items(&EventPayload::AccessReportUpdated {
+        let access = items(&EventPayload::AccessReportUpdated {
             report: AccessReport::default(),
         });
         assert_eq!(access[0].kind, ItemKind::System);
 
-        let error = transcript_items(&EventPayload::Error {
+        let error = items(&EventPayload::Error {
             context: "llm".into(),
             message: "boom".into(),
         });
         assert_eq!(error[0].kind, ItemKind::Error);
         assert_eq!(error[0].text, "llm: boom");
 
-        let shutdown = transcript_items(&EventPayload::Shutdown {
+        let shutdown = items(&EventPayload::Shutdown {
             message: Some("bye".into()),
         });
         assert_eq!(shutdown[0].kind, ItemKind::Shutdown);
         assert_eq!(shutdown[0].text, "harness shut down: bye");
-        let silent = transcript_items(&EventPayload::Shutdown { message: None });
+        let silent = items(&EventPayload::Shutdown { message: None });
         assert_eq!(silent[0].text, "harness shut down");
+    }
+
+    #[test]
+    fn workspace_folder_names() {
+        assert_eq!(workspace_folder_name("/a/b/myproject"), "myproject");
+        assert_eq!(workspace_folder_name("/a/b/myproject/"), "myproject");
+        assert_eq!(workspace_folder_name("relative/dir"), "dir");
+        assert_eq!(workspace_folder_name("plain"), "plain");
     }
 
     // --- cost formatting ---
@@ -1066,6 +1354,7 @@ mod tests {
             1,
             EventPayload::UserPrompt {
                 client_id: None,
+                client_name: None,
                 text: "hi".into(),
             },
         ));
@@ -1074,6 +1363,7 @@ mod tests {
             1,
             EventPayload::UserPrompt {
                 client_id: None,
+                client_name: None,
                 text: "hi".into(),
             },
         ));
@@ -1081,6 +1371,7 @@ mod tests {
             0,
             EventPayload::UserPrompt {
                 client_id: None,
+                client_name: None,
                 text: "older".into(),
             },
         ));
@@ -1097,10 +1388,104 @@ mod tests {
             1,
             EventPayload::UserPrompt {
                 client_id: None,
+                client_name: None,
                 text: "go".into(),
             },
         ));
         assert!(!app.awaiting_input);
+    }
+
+    #[test]
+    fn busy_follows_the_event_stream() {
+        let mut app = app();
+        assert!(!app.busy);
+        app.apply_event(event(
+            0,
+            EventPayload::UserPrompt {
+                client_id: None,
+                client_name: None,
+                text: "go".into(),
+            },
+        ));
+        assert!(app.busy);
+        app.apply_event(event(1, EventPayload::AwaitingInput));
+        assert!(!app.busy);
+        app.apply_event(event(
+            2,
+            EventPayload::ToolUse {
+                agent: "agent-0".into(),
+                call: ToolCall {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                },
+            },
+        ));
+        assert!(app.busy);
+        app.apply_event(event(
+            3,
+            EventPayload::Interrupted {
+                agent: "agent-0".into(),
+            },
+        ));
+        assert!(!app.busy);
+        // Events without busy information leave the state alone.
+        app.apply_event(event(
+            4,
+            EventPayload::CostReport {
+                backend: "mock".into(),
+                usage: UsageSnapshot::default(),
+                quota: QuotaConfig::default(),
+            },
+        ));
+        assert!(!app.busy);
+    }
+
+    #[test]
+    fn spinner_advances_per_applied_event_only() {
+        let mut app = app();
+        let before = app.spinner_frame;
+        app.apply_event(event(0, EventPayload::AwaitingInput));
+        app.apply_event(event(
+            1,
+            EventPayload::UserPrompt {
+                client_id: None,
+                client_name: None,
+                text: "go".into(),
+            },
+        ));
+        assert_eq!(app.spinner_frame, before + 2);
+        // A duplicate event is skipped and does not advance the spinner.
+        app.apply_event(event(
+            1,
+            EventPayload::UserPrompt {
+                client_id: None,
+                client_name: None,
+                text: "go".into(),
+            },
+        ));
+        assert_eq!(app.spinner_frame, before + 2);
+        let _ = app.spinner_char();
+    }
+
+    #[test]
+    fn esc_sends_an_interrupt_only_while_busy() {
+        let mut app = app();
+        assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
+        app.apply_event(event(
+            0,
+            EventPayload::UserPrompt {
+                client_id: None,
+                client_name: None,
+                text: "go".into(),
+            },
+        ));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)),
+            vec![ClientMessage::Interrupt]
+        );
+        app.apply_event(event(1, EventPayload::AwaitingInput));
+        assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
     }
 
     #[test]
@@ -1279,6 +1664,12 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)),
             vec![ClientMessage::Shutdown]
         );
+        app.input = "/stop".into();
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            vec![ClientMessage::Interrupt]
+        );
+        assert!(app.input.is_empty());
     }
 
     #[test]
@@ -1287,6 +1678,97 @@ mod tests {
         app.input = "/quit".into();
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn help_command_opens_the_popup_locally() {
+        let mut app = app();
+        app.input = "/help".into();
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.popup, Some(Popup::Help));
+        assert!(app.input.is_empty());
+        // Any key closes it, like the other popups.
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn debug_command_toggles_the_per_session_flag() {
+        let mut app = app();
+        assert!(!app.debug);
+        app.input = "/debug".into();
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        assert!(app.debug);
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem {
+                kind: ItemKind::System,
+                ..
+            })
+        ));
+        app.input = "/debug".into();
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.debug);
+    }
+
+    #[test]
+    fn unknown_command_error_points_at_help() {
+        let mut app = app();
+        app.input = "/nope".into();
+        app.handle_key(key(KeyCode::Enter));
+        let last = app.transcript.last().unwrap();
+        assert_eq!(last.kind, ItemKind::Error);
+        assert!(last.text.contains("/help"));
+    }
+
+    #[test]
+    fn harness_started_records_the_workspace_and_id() {
+        let mut app = app();
+        assert_eq!(app.harness_label(), "127.0.0.1:7777");
+        app.apply_event(event(
+            0,
+            EventPayload::HarnessStarted {
+                harness_id: "deadbeef42".into(),
+                workspace: "/home/user/myproject".into(),
+                sandbox: "mock".into(),
+                llm: "mock".into(),
+            },
+        ));
+        assert_eq!(app.harness_label(), "myproject");
+        assert_eq!(app.harness_id, "deadbeef42");
+    }
+
+    #[test]
+    fn run_file_workspace_seeds_the_label() {
+        let app = App::new(
+            "127.0.0.1:7777".into(),
+            "ab".repeat(32),
+            Some("/srv/work/thing".into()),
+        );
+        assert_eq!(app.harness_label(), "thing");
+    }
+
+    #[test]
+    fn agent_names_feed_later_transcript_lines() {
+        let mut app = app();
+        app.apply_event(event(
+            0,
+            EventPayload::AgentSpawned {
+                parent: "agent-0".into(),
+                agent: "agent-1".into(),
+                name: Some("refactor tests".into()),
+                prompt: "go".into(),
+            },
+        ));
+        app.apply_event(event(
+            1,
+            EventPayload::AssistantText {
+                agent: "agent-1".into(),
+                text: "working".into(),
+            },
+        ));
+        let last = app.transcript.last().unwrap();
+        assert_eq!(last.text, "  [subagent refactor tests] working");
     }
 
     #[test]

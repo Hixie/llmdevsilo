@@ -64,6 +64,9 @@ pub struct ConnectTarget {
     /// State directory for persisting the key id and the host fingerprint
     /// after a successful remote authentication. `None` for local targets.
     pub persist_state_dir: Option<PathBuf>,
+    /// Workspace path from the run file, for display. `None` for remote
+    /// targets, which learn it from the harness_started event.
+    pub workspace: Option<String>,
 }
 
 // --- known-hosts and key persistence ---

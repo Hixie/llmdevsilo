@@ -160,6 +160,14 @@ impl AuthorizedKeys {
             .and_then(|record| parse_public_key(&record.public_key_b64))
     }
 
+    /// Display name registered for a key at pairing time.
+    pub(crate) fn client_name(&self, key_id: &str) -> Option<String> {
+        self.records
+            .get(key_id)
+            .map(|record| record.client_name.clone())
+            .filter(|name| !name.is_empty())
+    }
+
     fn save(&self) -> Result<(), FrontendError> {
         let text = serde_json::to_string_pretty(&self.records)
             .map_err(|e| FrontendError::Setup(format!("unserializable key registry: {e}")))?;

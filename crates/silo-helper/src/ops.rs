@@ -2,6 +2,7 @@
 //! directory listing. Each handler returns its failure as a per-request
 //! error string, never a panic.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,8 @@ use std::time::Duration;
 
 use silo_core::helper::{b64, unb64, DirEntry, HelperOp, HelperPayload};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
 
 use crate::fetch::{FetchConfig, FetchState};
 
@@ -25,17 +27,45 @@ const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) struct ServeState {
     fetch: FetchState,
+    /// Cancellation senders for running `Exec` requests, keyed by request
+    /// id. Registered by the serve loop before the exec task is spawned,
+    /// so a `Cancel` read after the `Exec` always finds the entry.
+    execs: Mutex<HashMap<u64, oneshot::Sender<()>>>,
 }
 
 impl ServeState {
     pub(crate) fn new(fetch_config: FetchConfig) -> Self {
         ServeState {
             fetch: FetchState::new(fetch_config),
+            execs: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Registers a cancellation channel for the `Exec` request `id` and
+    /// returns the receiving end for the exec task.
+    pub(crate) fn register_exec(&self, id: u64) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.execs
+            .lock()
+            .expect("exec cancel map poisoned")
+            .insert(id, tx);
+        rx
+    }
+
+    fn unregister_exec(&self, id: u64) {
+        self.execs
+            .lock()
+            .expect("exec cancel map poisoned")
+            .remove(&id);
     }
 }
 
-pub(crate) async fn handle_op(state: &ServeState, op: HelperOp) -> Result<HelperPayload, String> {
+pub(crate) async fn handle_op(
+    state: &ServeState,
+    id: u64,
+    op: HelperOp,
+    cancel: Option<oneshot::Receiver<()>>,
+) -> Result<HelperPayload, String> {
     match op {
         HelperOp::Hello => Ok(HelperPayload::Hello {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -46,7 +76,23 @@ pub(crate) async fn handle_op(state: &ServeState, op: HelperOp) -> Result<Helper
             cwd,
             env,
             timeout_ms,
-        } => exec(command, cwd, env, timeout_ms).await,
+        } => exec(state, id, cancel, command, cwd, env, timeout_ms).await,
+        HelperOp::Cancel { id: target } => {
+            let sender = state
+                .execs
+                .lock()
+                .expect("exec cancel map poisoned")
+                .remove(&target);
+            match sender {
+                Some(sender) => {
+                    let _ = sender.send(());
+                    Ok(HelperPayload::Ack)
+                }
+                // The target finished (or never existed) before the cancel
+                // arrived; the original request's response stands.
+                None => Err(format!("no cancellable request with id {target}")),
+            }
+        }
         HelperOp::ReadFile {
             path,
             offset,
@@ -131,7 +177,24 @@ fn buffer_contents(buffer: &Arc<Mutex<CappedBuffer>>) -> (String, bool) {
     )
 }
 
+/// Kills the child's process group, then the child itself, and reaps it.
+/// The child is its own process group leader (the spawn sets
+/// `process_group(0)`), so descendants of the shell die with it.
+async fn kill_child_group(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
 async fn exec(
+    state: &ServeState,
+    id: u64,
+    cancel: Option<oneshot::Receiver<()>>,
     command: String,
     cwd: Option<String>,
     env: Vec<(String, String)>,
@@ -149,31 +212,58 @@ async fn exec(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("cannot spawn shell: {e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "child stdout unavailable".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "child stderr unavailable".to_string())?;
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let spawned = cmd.spawn().map_err(|e| format!("cannot spawn shell: {e}"));
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(message) => {
+            state.unregister_exec(id);
+            return Err(message);
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        state.unregister_exec(id);
+        let _ = child.start_kill();
+        return Err("child stdio unavailable".to_string());
+    };
     let stdout_buffer = Arc::new(Mutex::new(CappedBuffer::new(EXEC_OUTPUT_CAP)));
     let stderr_buffer = Arc::new(Mutex::new(CappedBuffer::new(EXEC_OUTPUT_CAP)));
     let stdout_task = tokio::spawn(drain(stdout, stdout_buffer.clone()));
     let stderr_task = tokio::spawn(drain(stderr, stderr_buffer.clone()));
 
-    let timeout = Duration::from_millis(timeout_ms);
-    let (exit_code, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
-        Ok(Err(e)) => return Err(format!("wait for child failed: {e}")),
-        Err(_) => {
-            let _ = child.kill().await;
-            (-1, true)
+    let cancel_signal = async move {
+        match cancel {
+            Some(receiver) => {
+                let _ = receiver.await;
+            }
+            // No cancellation channel was registered for this execution.
+            None => std::future::pending::<()>().await,
         }
     };
+    let timeout = Duration::from_millis(timeout_ms);
+    let mut cancelled = false;
+    let (exit_code, timed_out) = tokio::select! {
+        () = cancel_signal => {
+            kill_child_group(&mut child).await;
+            cancelled = true;
+            (-1, false)
+        }
+        waited = tokio::time::timeout(timeout, child.wait()) => match waited {
+            Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
+            Ok(Err(e)) => {
+                state.unregister_exec(id);
+                return Err(format!("wait for child failed: {e}"));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                (-1, true)
+            }
+        },
+    };
+    state.unregister_exec(id);
 
     let _ = tokio::time::timeout(DRAIN_GRACE, async {
         let _ = stdout_task.await;
@@ -189,6 +279,7 @@ async fn exec(
         stderr,
         timed_out,
         truncated: stdout_truncated || stderr_truncated,
+        cancelled,
     })
 }
 
@@ -338,9 +429,23 @@ mod tests {
                 stderr,
                 timed_out,
                 truncated,
+                cancelled: _,
             } => (exit_code, stdout, stderr, timed_out, truncated),
             other => panic!("expected Exec payload, got {other:?}"),
         }
+    }
+
+    fn state() -> ServeState {
+        ServeState::new(FetchConfig::default())
+    }
+
+    async fn exec_plain(
+        command: &str,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+        timeout_ms: u64,
+    ) -> Result<HelperPayload, String> {
+        exec(&state(), 0, None, command.into(), cwd, env, timeout_ms).await
     }
 
     #[tokio::test]
@@ -481,14 +586,9 @@ mod tests {
 
     #[tokio::test]
     async fn exec_captures_streams_and_exit_code() {
-        let payload = exec(
-            "echo out; echo err >&2; exit 3".into(),
-            None,
-            vec![],
-            30_000,
-        )
-        .await
-        .unwrap();
+        let payload = exec_plain("echo out; echo err >&2; exit 3", None, vec![], 30_000)
+            .await
+            .unwrap();
         let (exit_code, stdout, stderr, timed_out, truncated) = payload_exec(payload);
         assert_eq!(exit_code, 3);
         assert_eq!(stdout, "out\n");
@@ -501,8 +601,8 @@ mod tests {
     async fn exec_honors_cwd_and_env() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
-        let payload = exec(
-            "printf '%s|%s' \"$PWD\" \"$SILO_TEST_VAR\"".into(),
+        let payload = exec_plain(
+            "printf '%s|%s' \"$PWD\" \"$SILO_TEST_VAR\"",
             Some(cwd.display().to_string()),
             vec![("SILO_TEST_VAR".into(), "marker".into())],
             30_000,
@@ -516,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_kills_on_timeout() {
-        let payload = exec("sleep 5".into(), None, vec![], 200).await.unwrap();
+        let payload = exec_plain("sleep 5", None, vec![], 200).await.unwrap();
         let (exit_code, _, _, timed_out, _) = payload_exec(payload);
         assert_eq!(exit_code, -1);
         assert!(timed_out);
@@ -525,11 +625,74 @@ mod tests {
     #[tokio::test]
     async fn exec_caps_output_at_one_mebibyte() {
         let command = "dd if=/dev/zero bs=1024 count=2048 2>/dev/null | tr '\\0' 'x'";
-        let payload = exec(command.into(), None, vec![], 60_000).await.unwrap();
+        let payload = exec_plain(command, None, vec![], 60_000).await.unwrap();
         let (exit_code, stdout, _, timed_out, truncated) = payload_exec(payload);
         assert_eq!(exit_code, 0);
         assert!(!timed_out);
         assert!(truncated);
         assert_eq!(stdout.len(), EXEC_OUTPUT_CAP);
+    }
+
+    #[tokio::test]
+    async fn cancel_ends_a_running_exec_with_partial_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let state = state();
+        let cancel_rx = state.register_exec(7);
+        let exec_future = exec(
+            &state,
+            7,
+            Some(cancel_rx),
+            format!(
+                "echo started; touch '{}'; sleep 30; echo finished",
+                marker.display()
+            ),
+            None,
+            vec![],
+            120_000,
+        );
+        tokio::pin!(exec_future);
+        // Drive the exec until the marker proves the echo ran, then cancel.
+        let payload = loop {
+            tokio::select! {
+                payload = &mut exec_future => break payload.unwrap(),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {
+                    if marker.exists() {
+                        let sender = state
+                            .execs
+                            .lock()
+                            .unwrap()
+                            .remove(&7);
+                        if let Some(sender) = sender {
+                            let _ = sender.send(());
+                        }
+                    }
+                }
+            }
+        };
+        match payload {
+            HelperPayload::Exec {
+                exit_code,
+                stdout,
+                timed_out,
+                cancelled,
+                ..
+            } => {
+                assert_eq!(exit_code, -1);
+                assert!(cancelled);
+                assert!(!timed_out);
+                assert_eq!(stdout, "started\n");
+            }
+            other => panic!("expected Exec payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_of_an_unknown_id_is_a_per_request_error() {
+        let state = state();
+        let err = handle_op(&state, 1, HelperOp::Cancel { id: 42 }, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("42"), "unexpected error: {err}");
     }
 }

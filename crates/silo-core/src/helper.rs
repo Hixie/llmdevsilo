@@ -54,6 +54,18 @@ pub enum HelperOp {
     ListDir {
         path: String,
     },
+    /// Cancels the in-flight request with this id. Only `Exec` requests
+    /// are cancellable: the helper kills the process group of that request
+    /// and the original `Exec` request then responds with exit code -1 and
+    /// `cancelled` true. `Cancel` itself answers `Ack`, or an error when
+    /// the id is unknown or already finished (a benign race: the response
+    /// may already be on the wire). The field serializes as `cancel_id`
+    /// because the op is flattened into `HelperRequest`, whose own `id`
+    /// occupies the `id` key.
+    Cancel {
+        #[serde(rename = "cancel_id")]
+        id: u64,
+    },
     /// HTTP request issued from inside the sandbox (and therefore through
     /// the egress proxy).
     Fetch {
@@ -87,6 +99,9 @@ pub enum HelperPayload {
         stderr: String,
         timed_out: bool,
         truncated: bool,
+        /// True when the execution was ended by a `Cancel` request.
+        #[serde(default)]
+        cancelled: bool,
     },
     File {
         content_b64: String,
@@ -190,5 +205,44 @@ mod tests {
     #[test]
     fn base64_roundtrip() {
         assert_eq!(unb64(&b64(b"data")).unwrap(), b"data");
+    }
+
+    #[test]
+    fn cancel_op_wire_format() {
+        let request = HelperRequest {
+            id: 9,
+            op: HelperOp::Cancel { id: 7 },
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"id": 9, "op": "cancel", "cancel_id": 7})
+        );
+        let parsed: HelperRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn exec_payload_without_cancelled_defaults_to_false() {
+        let value = serde_json::json!({
+            "payload": "exec",
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": false,
+            "truncated": false,
+        });
+        let parsed: HelperPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            parsed,
+            HelperPayload::Exec {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+                truncated: false,
+                cancelled: false,
+            }
+        );
     }
 }
