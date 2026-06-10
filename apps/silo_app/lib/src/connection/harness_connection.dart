@@ -349,7 +349,14 @@ class HarnessConnection extends ChangeNotifier {
 
   void requestCost() => _send(const RequestCostMessage());
 
-  void requestPairingCode() => _send(const RequestPairingCodeMessage());
+  void requestPairingCode() {
+    issuedPairingCode = null;
+    _send(const RequestPairingCodeMessage());
+  }
+
+  /// The pinned certificate fingerprint for this endpoint, if one is
+  /// stored (hex SHA-256).
+  Future<String?> pinnedFingerprint() => _secrets.read(endpoint.fingerprintKey);
 
   void requestShutdown() => _send(const ShutdownMessage());
 

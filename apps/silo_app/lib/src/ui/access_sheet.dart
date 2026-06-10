@@ -4,6 +4,7 @@ library;
 import 'package:flutter/material.dart';
 
 import '../protocol/sandbox.dart';
+import 'theme.dart';
 
 void showAccessSheet(BuildContext context, AccessReport? report) {
   showModalBottomSheet<void>(
@@ -104,7 +105,7 @@ class _AccessSheetBody extends StatelessWidget {
                 child: SelectableText(
                   item,
                   style: const TextStyle(
-                    fontFamily: 'monospace',
+                    fontFamily: monoFontFamily,
                     fontFamilyFallback: ['Menlo', 'Courier New'],
                     fontSize: 13,
                   ),

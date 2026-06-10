@@ -15,6 +15,7 @@ import '../connection/local_harness_options.dart';
 import '../connection/silo_locator.dart';
 import '../protocol/protocol.dart';
 import 'chat_screen.dart';
+import 'theme.dart';
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
@@ -181,7 +182,7 @@ class HomeScreen extends StatelessWidget {
                 Text('Command', style: Theme.of(context).textTheme.labelSmall),
                 SelectableText(
                   runCommandLine(options),
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                  style: const TextStyle(fontFamily: monoFontFamily, fontSize: 12),
                 ),
                 if (error.stderrTail.isNotEmpty) ...[
                   const SizedBox(height: 12),
@@ -190,7 +191,7 @@ class HomeScreen extends StatelessWidget {
                   SelectableText(
                     error.stderrTail,
                     style:
-                        const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                        const TextStyle(fontFamily: monoFontFamily, fontSize: 12),
                   ),
                 ],
               ],
@@ -828,7 +829,7 @@ class _StartLocalDialogState extends State<StartLocalDialog> {
               const SizedBox(height: 4),
               SelectableText(
                 options == null ? '—' : runCommandLine(options),
-                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                style: const TextStyle(fontFamily: monoFontFamily, fontSize: 12),
               ),
             ],
           ),

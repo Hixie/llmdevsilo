@@ -143,6 +143,14 @@ pub struct FrontendConfig {
     /// Print a pairing code on startup (interactive frontend).
     #[serde(default)]
     pub issue_pairing_code: bool,
+    /// PEM certificate chain for the interactive server. Set together with
+    /// `tls_key_path`; used instead of the generated self-signed
+    /// certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert_path: Option<PathBuf>,
+    /// PEM private key matching `tls_cert_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key_path: Option<PathBuf>,
 }
 
 impl Default for FrontendConfig {
@@ -152,6 +160,8 @@ impl Default for FrontendConfig {
             listen_addr: None,
             headless_prompt: None,
             issue_pairing_code: false,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }
@@ -223,5 +233,17 @@ mod tests {
         let text = toml::to_string_pretty(&config).unwrap();
         let parsed: HarnessConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed, config);
+
+        let with_tls = HarnessConfig {
+            frontend: FrontendConfig {
+                tls_cert_path: Some(PathBuf::from("/tmp/cert.pem")),
+                tls_key_path: Some(PathBuf::from("/tmp/key.pem")),
+                ..FrontendConfig::default()
+            },
+            ..config
+        };
+        let text = toml::to_string_pretty(&with_tls).unwrap();
+        let parsed: HarnessConfig = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, with_tls);
     }
 }

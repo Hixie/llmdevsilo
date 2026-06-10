@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import 'src/connection/harness_registry.dart';
 import 'src/connection/secret_store.dart';
 import 'src/ui/home_screen.dart';
+import 'src/ui/theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -20,19 +21,8 @@ class SiloApp extends StatelessWidget {
       child: MaterialApp(
         title: 'Silo',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: const Color(0xFF356859),
-          ),
-          visualDensity: VisualDensity.adaptivePlatformDensity,
-        ),
-        darkTheme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: const Color(0xFF356859),
-            brightness: Brightness.dark,
-          ),
-          visualDensity: VisualDensity.adaptivePlatformDensity,
-        ),
+        theme: siloTheme(Brightness.light),
+        darkTheme: siloTheme(Brightness.dark),
         home: const HomeScreen(),
       ),
     );

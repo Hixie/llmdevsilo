@@ -30,10 +30,28 @@ class _ChatViewState extends State<ChatView> {
   final ScrollController _scroll = ScrollController();
   int _lastLength = 0;
 
+  /// Whether the view tracks new content. True while the user is within
+  /// [_followSlop] of the bottom; scrolling further up releases the view so
+  /// new events do not pull it back down.
+  bool _followBottom = true;
+
+  static const double _followSlop = 64;
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_onScroll);
+  }
+
   @override
   void dispose() {
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _onScroll() {
+    final position = _scroll.position;
+    _followBottom = position.pixels >= position.maxScrollExtent - _followSlop;
   }
 
   void _maybeAutoScroll(int length) {
@@ -41,13 +59,12 @@ class _ChatViewState extends State<ChatView> {
       return;
     }
     _lastLength = length;
+    if (!_followBottom) {
+      return;
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients) {
-        _scroll.animateTo(
-          _scroll.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
-        );
+      if (mounted && _scroll.hasClients) {
+        _scroll.jumpTo(_scroll.position.maxScrollExtent);
       }
     });
   }
@@ -70,35 +87,45 @@ class _ChatViewState extends State<ChatView> {
           }
         }
         final live = widget.store.liveQuestion;
-        return Column(
-          children: [
-            Expanded(
-              child: tiles.isEmpty
-                  ? Center(
-                      child: Text(
-                        'No activity yet.\nSend a prompt to get started.',
-                        textAlign: TextAlign.center,
-                        style: Theme.of(context)
-                            .textTheme
-                            .bodyMedium
-                            ?.copyWith(
-                              color: Theme.of(context).colorScheme.outline,
-                            ),
-                      ),
-                    )
-                  : ListView(
-                      controller: _scroll,
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      children: tiles,
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            return Column(
+              children: [
+                Expanded(
+                  child: tiles.isEmpty
+                      ? Center(
+                          child: Text(
+                            'No activity yet.\nSend a prompt to get started.',
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context)
+                                .textTheme
+                                .bodyMedium
+                                ?.copyWith(
+                                  color: Theme.of(context).colorScheme.outline,
+                                ),
+                          ),
+                        )
+                      : ListView(
+                          controller: _scroll,
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          children: tiles,
+                        ),
+                ),
+                if (live != null)
+                  ConstrainedBox(
+                    // Cap the card; its body scrolls internally beyond this.
+                    constraints: BoxConstraints(
+                      maxHeight: constraints.maxHeight * 0.45,
                     ),
-            ),
-            if (live != null)
-              QuestionCard(
-                key: ValueKey('question-${live.id}'),
-                payload: live,
-                onAnswer: (answer) => widget.onAnswer(live.id, answer),
-              ),
-          ],
+                    child: QuestionCard(
+                      key: ValueKey('question-${live.id}'),
+                      payload: live,
+                      onAnswer: (answer) => widget.onAnswer(live.id, answer),
+                    ),
+                  ),
+              ],
+            );
+          },
         );
       },
     );

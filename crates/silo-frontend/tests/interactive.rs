@@ -1,9 +1,12 @@
 //! Integration tests for the interactive frontend: real TLS over loopback,
-//! authentication, event fan-out, catch-up, pairing, and question flow.
+//! authentication, event fan-out, catch-up, pairing, question flow, the
+//! browser landing page, and user-supplied certificates.
 
 use std::sync::Arc;
 
 use serde_json::json;
+use sha2::Digest;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use silo_core::clock::{FakeClock, SharedClock};
@@ -33,23 +36,21 @@ fn new_bus() -> EventBus {
     EventBus::new(clock.clone(), JournalHandle::disabled(clock))
 }
 
-async fn boot() -> TestServer {
-    boot_with_bus(new_bus()).await
+fn interactive_config() -> FrontendConfig {
+    FrontendConfig {
+        kind: FrontendKind::Interactive,
+        ..FrontendConfig::default()
+    }
 }
 
-async fn boot_with_bus(bus: EventBus) -> TestServer {
-    let state_dir = tempfile::tempdir().unwrap();
-    let (commands_tx, commands_rx) = mpsc::channel(8);
-    let config = FrontendConfig {
-        kind: FrontendKind::Interactive,
-        listen_addr: None,
-        headless_prompt: None,
-        issue_pairing_code: false,
-    };
-    let mut frontend = silo_frontend::create_frontend(&config, None).unwrap();
-    let ctx = FrontendContext {
+fn test_context(
+    state_dir: &tempfile::TempDir,
+    bus: EventBus,
+    commands_tx: mpsc::Sender<FrontendCommand>,
+) -> FrontendContext {
+    FrontendContext {
         harness_id: HARNESS_ID.into(),
-        bus: bus.clone(),
+        bus,
         commands: commands_tx,
         access: AccessReport {
             sandbox_kind: "mock".into(),
@@ -58,7 +59,22 @@ async fn boot_with_bus(bus: EventBus) -> TestServer {
         },
         state_dir: state_dir.path().to_path_buf(),
         workspace: "/tmp/ws".into(),
-    };
+    }
+}
+
+async fn boot() -> TestServer {
+    boot_with(new_bus(), interactive_config()).await
+}
+
+async fn boot_with_bus(bus: EventBus) -> TestServer {
+    boot_with(bus, interactive_config()).await
+}
+
+async fn boot_with(bus: EventBus, config: FrontendConfig) -> TestServer {
+    let state_dir = tempfile::tempdir().unwrap();
+    let (commands_tx, commands_rx) = mpsc::channel(8);
+    let mut frontend = silo_frontend::create_frontend(&config, None).unwrap();
+    let ctx = test_context(&state_dir, bus.clone(), commands_tx);
     frontend.start(ctx).await.unwrap();
 
     let harnesses = client::list_local_harnesses(state_dir.path());
@@ -572,6 +588,120 @@ async fn client_shutdown_message_forwards_a_frontend_command() {
         FrontendCommand::Shutdown { message: None }
     );
     server.frontend.shutdown(None).await.unwrap();
+}
+
+/// Opens a raw TLS connection (no WebSocket handshake) with the server
+/// certificate pinned by fingerprint.
+async fn raw_tls_connect(
+    addr: &str,
+    fingerprint_hex: &str,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let verifier = Arc::new(client::PinnedServerCertVerifier::new(fingerprint_hex).unwrap());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    connector.connect(server_name, tcp).await.unwrap()
+}
+
+#[tokio::test]
+async fn browser_get_serves_the_landing_page_and_websocket_still_works() {
+    let mut server = boot().await;
+
+    let mut tls = raw_tls_connect(&server.run.addr, &server.run.cert_fingerprint_sha256).await;
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains("Content-Type: text/html; charset=utf-8"));
+    assert!(response.contains("Connection: close"));
+    assert!(response.contains(HARNESS_ID));
+    assert!(response.contains("wss://x"));
+
+    // The same server still accepts a full WebSocket auth flow.
+    let (mut stream, _) = connect_and_auth(&server).await;
+    client::send_client(&mut stream, &ClientMessage::Ping { nonce: 7 })
+        .await
+        .unwrap();
+    loop {
+        match client::recv_server(&mut stream).await.unwrap() {
+            ServerMessage::Pong { nonce } => {
+                assert_eq!(nonce, 7);
+                break;
+            }
+            _ => continue,
+        }
+    }
+    server.frontend.shutdown(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn garbage_first_bytes_are_dropped_and_the_server_keeps_serving() {
+    let mut server = boot().await;
+
+    // No \r\n\r\n within the 8 KiB head cap: the connection is dropped.
+    let mut tls = raw_tls_connect(&server.run.addr, &server.run.cert_fingerprint_sha256).await;
+    let garbage = vec![b'x'; 9 * 1024];
+    let _ = tls.write_all(&garbage).await;
+    let _ = tls.flush().await;
+    let mut rest = Vec::new();
+    let _ = tls.read_to_end(&mut rest).await;
+
+    // The server is still alive and authenticates new clients.
+    let (_stream, auth) = connect_and_auth(&server).await;
+    assert!(!auth.client_id.is_empty());
+    server.frontend.shutdown(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn user_supplied_certificate_is_pinned_by_its_own_fingerprint() {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let tls_dir = tempfile::tempdir().unwrap();
+    let cert_path = tls_dir.path().join("cert.pem");
+    let key_path = tls_dir.path().join("key.pem");
+    std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+    std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+    let expected = hex::encode(sha2::Sha256::digest(certified.cert.der().as_ref()));
+
+    let config = FrontendConfig {
+        kind: FrontendKind::Interactive,
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(key_path),
+        ..FrontendConfig::default()
+    };
+    let mut server = boot_with(new_bus(), config).await;
+
+    // The run file advertises the supplied certificate's fingerprint, and
+    // a client pinning it completes the auth flow.
+    assert_eq!(server.run.cert_fingerprint_sha256, expected);
+    let (_stream, auth) = connect_and_auth(&server).await;
+    assert!(auth.key_id.is_none());
+    server.frontend.shutdown(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn tls_cert_path_without_a_key_path_fails_setup() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let (commands_tx, _commands_rx) = mpsc::channel(8);
+    let config = FrontendConfig {
+        kind: FrontendKind::Interactive,
+        tls_cert_path: Some("/tmp/cert.pem".into()),
+        ..FrontendConfig::default()
+    };
+    let mut frontend = silo_frontend::create_frontend(&config, None).unwrap();
+    let ctx = test_context(&state_dir, new_bus(), commands_tx);
+    let error = frontend.start(ctx).await.unwrap_err();
+    assert!(matches!(error, silo_core::error::FrontendError::Setup(_)));
+    assert!(error.to_string().contains("tls_key_path"));
 }
 
 #[tokio::test]

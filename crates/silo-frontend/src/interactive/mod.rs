@@ -31,6 +31,7 @@ use crate::tools;
 
 mod auth;
 mod connection;
+mod http;
 mod tls;
 
 pub fn create(config: &FrontendConfig) -> Result<Box<dyn Frontend>, FrontendError> {
@@ -56,6 +57,9 @@ struct Started {
 /// State shared with the connection tasks.
 struct Shared {
     harness_id: String,
+    /// Address the listener is bound to; the landing page falls back to it
+    /// when a request has no Host header.
+    listen_addr: SocketAddr,
     bus: EventBus,
     commands: mpsc::Sender<FrontendCommand>,
     access: AccessReport,
@@ -100,7 +104,20 @@ impl Frontend for InteractiveFrontend {
         }
         let harness_dir = silo_core::paths::harness_dir(&ctx.state_dir, &ctx.harness_id);
         std::fs::create_dir_all(&harness_dir)?;
-        let material = tls::load_or_create(&harness_dir)?;
+        let material = match (&self.config.tls_cert_path, &self.config.tls_key_path) {
+            (Some(cert_path), Some(key_path)) => tls::load_pair(cert_path, key_path)?,
+            (None, None) => tls::load_or_create(&harness_dir)?,
+            (Some(_), None) => {
+                return Err(FrontendError::Setup(
+                    "tls_cert_path is set without tls_key_path; supply both or neither".into(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(FrontendError::Setup(
+                    "tls_key_path is set without tls_cert_path; supply both or neither".into(),
+                ))
+            }
+        };
         let token_path = harness_dir.join("local-token");
         let token = auth::load_or_create_token(&token_path)?;
         let keys = auth::AuthorizedKeys::load(&harness_dir.join("authorized-keys.json"))?;
@@ -131,6 +148,7 @@ impl Frontend for InteractiveFrontend {
         let (shutdown_tx, _) = watch::channel(false);
         let shared = Arc::new(Shared {
             harness_id: ctx.harness_id,
+            listen_addr: local_addr,
             bus: ctx.bus,
             commands: ctx.commands,
             access: ctx.access,

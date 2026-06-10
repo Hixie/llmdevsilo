@@ -8,6 +8,7 @@ use std::time::Duration;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use rand::RngCore;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio_rustls::TlsAcceptor;
@@ -20,11 +21,13 @@ use silo_core::protocol::{AuthRequest, ClientMessage, ServerMessage};
 use silo_core::traits::FrontendCommand;
 
 use super::auth;
+use super::http;
 use super::Shared;
 
-type WsStream = WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>;
+type WsStream = WebSocketStream<http::PrefixedStream<tokio_rustls::server::TlsStream<TcpStream>>>;
 
 /// Each message of the authentication phase must arrive within this window.
+/// The HTTP request head after the TLS handshake shares the same limit.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Accepts connections until shutdown, spawning a handler task per client.
@@ -52,11 +55,25 @@ pub(super) async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, sh
 }
 
 async fn handle_connection(tcp: TcpStream, acceptor: TlsAcceptor, shared: Arc<Shared>) {
-    let tls = match acceptor.accept(tcp).await {
+    let mut tls = match acceptor.accept(tcp).await {
         Ok(tls) => tls,
         Err(_) => return,
     };
-    let mut ws = match tokio_tungstenite::accept_async(tls).await {
+    // Peek the HTTP request head so plain browser navigations get a
+    // landing page instead of a WebSocket protocol error. The bytes are
+    // replayed into the WebSocket handshake through PrefixedStream.
+    let head = match tokio::time::timeout(AUTH_TIMEOUT, http::read_request_head(&mut tls)).await {
+        Ok(Some(head)) => head,
+        Ok(None) | Err(_) => return,
+    };
+    if !http::is_websocket_upgrade(&head) {
+        let response = http::landing_page_response(&shared.harness_id, &head, shared.listen_addr);
+        let _ = tls.write_all(response.as_bytes()).await;
+        let _ = tls.shutdown().await;
+        return;
+    }
+    let prefixed = http::PrefixedStream::new(head, tls);
+    let mut ws = match tokio_tungstenite::accept_async(prefixed).await {
         Ok(ws) => ws,
         Err(_) => return,
     };

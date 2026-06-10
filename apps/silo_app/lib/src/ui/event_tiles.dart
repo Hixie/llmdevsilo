@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 
 import '../connection/event_store.dart';
 import '../protocol/event.dart';
+import 'theme.dart';
 
 /// Builds the transcript widget for [event], or null when the event has no
 /// transcript representation (cost reports, turn markers, and answers,
@@ -193,7 +194,7 @@ class _CollapsiblePayloadTile extends StatelessWidget {
               SelectableText(
                 body,
                 style: const TextStyle(
-                  fontFamily: 'monospace',
+                  fontFamily: monoFontFamily,
                   fontFamilyFallback: ['Menlo', 'Courier New'],
                   fontSize: 12,
                 ),

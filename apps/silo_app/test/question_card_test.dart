@@ -42,6 +42,9 @@ void main() {
       onAnswer: (value) => answer = value,
     )));
 
+    // Option descriptions render under the label.
+    expect(find.text('warm'), findsOneWidget);
+
     await tester.tap(find.text('Blue'));
     await tester.pump();
     expect(answer, 'Blue');
@@ -96,9 +99,22 @@ void main() {
     )));
 
     await tester.enterText(find.byType(TextField), '  custom answer  ');
-    await tester.tap(find.text('Answer'));
+    await tester.tap(find.byTooltip('Send answer'));
     await tester.pump();
     expect(answer, 'custom answer');
+  });
+
+  testWidgets('free text submits on enter', (tester) async {
+    String? answer;
+    await tester.pumpWidget(wrap(QuestionCard(
+      payload: asked('q-1', allowFreeText: true),
+      onAnswer: (value) => answer = value,
+    )));
+
+    await tester.enterText(find.byType(TextField), 'typed answer');
+    await tester.testTextInput.receiveAction(TextInputAction.send);
+    await tester.pump();
+    expect(answer, 'typed answer');
   });
 
   testWidgets('multi-select appends free text to the selection',

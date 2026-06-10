@@ -92,6 +92,15 @@ code (TUI: `/pair`), or start the harness with `--pairing-code`. Enter the
 address, code, and certificate fingerprint in the remote client; it
 generates a key pair and authenticates with signatures from then on.
 
+Browsers (the web build of the Flutter client) cannot pin the harness's
+self-signed certificate the way the other clients do. Either open
+`https://host:port` in the browser once and accept the certificate warning
+— the harness answers with a small confirmation page, and the web client
+can connect from then on — or start the harness with `--tls-cert` and
+`--tls-key` pointing at a PEM certificate and key the browser already
+trusts (for development, [mkcert](https://github.com/FiloSottile/mkcert)
+generates such certificates).
+
 ## Choosing a sandbox
 
 | Backend | Platform | Status | Use case |

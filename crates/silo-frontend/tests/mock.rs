@@ -24,9 +24,7 @@ fn new_bus() -> EventBus {
 fn mock_config() -> FrontendConfig {
     FrontendConfig {
         kind: FrontendKind::Mock,
-        listen_addr: None,
-        headless_prompt: None,
-        issue_pairing_code: false,
+        ..FrontendConfig::default()
     }
 }
 

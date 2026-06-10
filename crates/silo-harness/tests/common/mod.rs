@@ -101,9 +101,7 @@ pub fn mock_config(workspace: &Path) -> HarnessConfig {
         sandbox: SandboxConfig::default(),
         frontend: FrontendConfig {
             kind: FrontendKind::Mock,
-            listen_addr: None,
-            headless_prompt: None,
-            issue_pairing_code: false,
+            ..FrontendConfig::default()
         },
         logging: LoggingConfig::default(),
     }

@@ -170,9 +170,8 @@ mod tests {
     fn config(prompt: Option<&str>) -> FrontendConfig {
         FrontendConfig {
             kind: FrontendKind::Headless,
-            listen_addr: None,
             headless_prompt: prompt.map(str::to_string),
-            issue_pairing_code: false,
+            ..FrontendConfig::default()
         }
     }
 

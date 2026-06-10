@@ -102,4 +102,60 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.textContaining('cargo test'), findsOneWidget);
   });
+
+  testWidgets('transcript follows new events only when already near the bottom',
+      (tester) async {
+    tester.view.physicalSize = const Size(800, 400);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final store = EventStore();
+    store.insertAll([
+      for (var i = 0; i < 30; i++)
+        event(i, AssistantTextPayload(agent: 'agent-0', text: 'line $i')),
+    ]);
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: ChatView(store: store, onAnswer: (_, _) {}),
+      ),
+    ));
+    await tester.pump();
+
+    // SelectableText embeds its own Scrollable, so pick the transcript list's.
+    final position = tester
+        .state<ScrollableState>(find
+            .descendant(
+                of: find.byType(ListView), matching: find.byType(Scrollable))
+            .first)
+        .position;
+    expect(position.pixels, position.maxScrollExtent);
+
+    // At the bottom: a new event keeps the view pinned there.
+    store.insertAll(
+        [event(30, const AssistantTextPayload(agent: 'agent-0', text: 'new'))]);
+    await tester.pump();
+    await tester.pump();
+    expect(position.pixels, position.maxScrollExtent);
+
+    // Scrolled up to read history: a new event leaves the view alone.
+    position.jumpTo(0);
+    await tester.pump();
+    store.insertAll([
+      event(31, const AssistantTextPayload(agent: 'agent-0', text: 'newer')),
+    ]);
+    await tester.pump();
+    await tester.pump();
+    expect(position.pixels, 0);
+
+    // Back near the bottom: following resumes.
+    position.jumpTo(position.maxScrollExtent - 10);
+    await tester.pump();
+    store.insertAll([
+      event(32, const AssistantTextPayload(agent: 'agent-0', text: 'newest')),
+    ]);
+    await tester.pump();
+    await tester.pump();
+    expect(position.pixels, position.maxScrollExtent);
+  });
 }

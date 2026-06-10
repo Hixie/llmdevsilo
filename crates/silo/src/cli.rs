@@ -116,6 +116,13 @@ pub struct RunArgs {
     /// Listen address for the interactive WebSocket server.
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+    /// PEM certificate chain for the interactive server (requires
+    /// --tls-key).
+    #[arg(long = "tls-cert")]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key matching --tls-cert.
+    #[arg(long = "tls-key")]
+    pub tls_key: Option<PathBuf>,
     /// Host path the sandbox may read (repeatable).
     #[arg(long = "allow-read")]
     pub allow_read: Vec<PathBuf>,
@@ -277,6 +284,12 @@ pub fn build_run_config(args: &RunArgs) -> anyhow::Result<HarnessConfig> {
     if let Some(listen) = args.listen {
         config.frontend.listen_addr = Some(listen);
     }
+    if let Some(tls_cert) = &args.tls_cert {
+        config.frontend.tls_cert_path = Some(tls_cert.clone());
+    }
+    if let Some(tls_key) = &args.tls_key {
+        config.frontend.tls_key_path = Some(tls_key.clone());
+    }
     if args.pairing_code {
         config.frontend.issue_pairing_code = true;
     }
@@ -321,6 +334,9 @@ pub fn build_run_config(args: &RunArgs) -> anyhow::Result<HarnessConfig> {
     // Cross-field requirements.
     if config.frontend.kind == FrontendKind::Headless && config.frontend.headless_prompt.is_none() {
         bail!("the headless frontend requires --prompt");
+    }
+    if config.frontend.tls_cert_path.is_some() != config.frontend.tls_key_path.is_some() {
+        bail!("--tls-cert and --tls-key (or tls_cert_path and tls_key_path) must be set together");
     }
     let needs_script = config.frontend.kind == FrontendKind::Mock
         || config.llm.backend == LlmBackendKind::Mock
@@ -434,6 +450,43 @@ mod tests {
         assert_eq!(config.llm.model, "gpt-test");
         assert_eq!(config.frontend.kind, FrontendKind::Headless);
         assert_eq!(config.frontend.headless_prompt.as_deref(), Some("do it"));
+    }
+
+    #[test]
+    fn tls_flags_map_to_the_frontend_config() {
+        let args = parse_run(&[
+            "--llm",
+            "anthropic",
+            "--sandbox",
+            "gvisor",
+            "--tls-cert",
+            "/tmp/cert.pem",
+            "--tls-key",
+            "/tmp/key.pem",
+        ]);
+        let config = build_run_config(&args).unwrap();
+        assert_eq!(
+            config.frontend.tls_cert_path,
+            Some(PathBuf::from("/tmp/cert.pem"))
+        );
+        assert_eq!(
+            config.frontend.tls_key_path,
+            Some(PathBuf::from("/tmp/key.pem"))
+        );
+    }
+
+    #[test]
+    fn tls_cert_and_key_must_be_set_together() {
+        for flags in [
+            &["--tls-cert", "/tmp/cert.pem"][..],
+            &["--tls-key", "/tmp/key.pem"][..],
+        ] {
+            let mut argv = vec!["--llm", "anthropic", "--sandbox", "gvisor"];
+            argv.extend_from_slice(flags);
+            let args = parse_run(&argv);
+            let error = build_run_config(&args).unwrap_err();
+            assert!(error.to_string().contains("--tls-cert"), "{flags:?}");
+        }
     }
 
     #[test]

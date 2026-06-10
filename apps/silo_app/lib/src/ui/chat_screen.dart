@@ -2,12 +2,16 @@
 library;
 
 import 'package:file_selector/file_selector.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
 import '../connection/harness_connection.dart';
 import '../protocol/event.dart';
 import 'access_sheet.dart';
 import 'chat_view.dart';
+import 'pairing_info.dart';
+import 'pairing_sheet.dart';
+import 'theme.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key, required this.connection});
@@ -68,42 +72,25 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Future<void> _showPairingCode() async {
+  Future<void> _showPairingSheet() async {
     connection.requestPairingCode();
-    await showDialog<void>(
+    final fingerprint = await connection.pinnedFingerprint();
+    if (!mounted) {
+      return;
+    }
+    await showModalBottomSheet<void>(
       context: context,
-      builder: (context) => ListenableBuilder(
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (sheetContext) => ListenableBuilder(
         listenable: connection,
         builder: (context, _) {
           final code = connection.issuedPairingCode;
-          return AlertDialog(
-            title: const Text('Pairing code'),
-            content: code == null
-                ? const SizedBox(
-                    height: 60,
-                    child: Center(child: CircularProgressIndicator()),
-                  )
-                : Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      SelectableText(
-                        code.code,
-                        style: Theme.of(context)
-                            .textTheme
-                            .headlineMedium
-                            ?.copyWith(letterSpacing: 4),
-                      ),
-                      const SizedBox(height: 8),
-                      Text('Expires in ${code.expiresInSecs} seconds. '
-                          'Enter it on the other device.'),
-                    ],
-                  ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(),
-                child: const Text('Done'),
-              ),
-            ],
+          return PairingSheet(
+            url: connection.endpoint.url,
+            fingerprint: fingerprint,
+            code: code?.code,
+            expiresInSecs: code?.expiresInSecs,
           );
         },
       ),
@@ -247,6 +234,28 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  /// The error message followed by certificate guidance for browsers,
+  /// which reject the harness's self-signed certificate until the user
+  /// accepts it once.
+  Widget _withWebCertHelp(BuildContext context, String error) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(error),
+        const SizedBox(height: 8),
+        const Text('If the browser is blocking the harness\'s self-signed '
+            'certificate, open this address in a new tab, accept the '
+            'certificate warning, then retry:'),
+        const SizedBox(height: 4),
+        SelectableText(
+          httpsOriginFromWsUrl(connection.endpoint.url),
+          style: const TextStyle(fontFamily: monoFontFamily, fontSize: 13),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
@@ -277,7 +286,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 onSelected: (value) {
                   switch (value) {
                     case 'pair':
-                      _showPairingCode();
+                      _showPairingSheet();
                     case 'shutdown':
                       _confirmShutdown();
                   }
@@ -312,8 +321,25 @@ class _ChatScreenState extends State<ChatScreen> {
               if (connection.status == ConnectionStatus.failed &&
                   connection.lastError != null)
                 MaterialBanner(
-                  content: Text(connection.lastError!),
+                  content: kIsWeb
+                      ? _withWebCertHelp(context, connection.lastError!)
+                      : Text(connection.lastError!),
                   leading: const Icon(Icons.error_outline),
+                  actions: [
+                    TextButton(
+                      onPressed: connection.connect,
+                      child: const Text('Retry'),
+                    ),
+                  ],
+                )
+              else if (kIsWeb &&
+                  connection.lastError != null &&
+                  connection.status != ConnectionStatus.connected &&
+                  connection.status != ConnectionStatus.authenticating)
+                MaterialBanner(
+                  content: _withWebCertHelp(
+                      context, 'Could not connect: ${connection.lastError!}'),
+                  leading: const Icon(Icons.lock_outline),
                   actions: [
                     TextButton(
                       onPressed: connection.connect,

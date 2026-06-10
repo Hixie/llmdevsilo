@@ -17,9 +17,8 @@ use silo_core::traits::{FrontendCommand, FrontendContext};
 fn headless_config(prompt: Option<&str>) -> FrontendConfig {
     FrontendConfig {
         kind: FrontendKind::Headless,
-        listen_addr: None,
         headless_prompt: prompt.map(str::to_string),
-        issue_pairing_code: false,
+        ..FrontendConfig::default()
     }
 }
 
@@ -87,9 +86,7 @@ fn headless_factory_requires_a_prompt() {
 fn mock_factory_requires_a_script() {
     let config = FrontendConfig {
         kind: FrontendKind::Mock,
-        listen_addr: None,
-        headless_prompt: None,
-        issue_pairing_code: false,
+        ..FrontendConfig::default()
     };
     let result = silo_frontend::create_frontend(&config, None);
     assert!(matches!(result, Err(FrontendError::Setup(_))));

@@ -57,11 +57,26 @@ app probes.
 ## Pairing from a phone (or any remote client)
 
 1. On a client that is already connected (for example the desktop app or
-   the TUI), choose **Pair another device**. The harness issues a one-time
-   pairing code (8 characters, valid for 120 seconds).
+   the TUI), choose **Pair another device**. The app opens a sheet with
+   everything the other device needs:
+
+   - the harness's WebSocket URL (`wss://host:port`);
+   - the pinned certificate fingerprint (hex SHA-256);
+   - a one-time pairing code (8 characters, valid for 120 seconds), shown
+     large with a live countdown.
+
+   Every field has a copy button, and **Copy connection details** copies
+   the whole block at once. When the harness address is loopback
+   (`127.0.0.1` or `localhost`) or unspecified (`0.0.0.0`), the sheet also
+   lists candidate LAN URLs built from this machine's network interfaces,
+   since the address the app used is not dialable from another device. A
+   loopback address additionally gets a warning: other devices cannot
+   reach the harness at all unless `silo run` was started with
+   `--listen 0.0.0.0:<port>` (or a LAN address), and the sheet shows that
+   exact flag with the real port.
 2. On the phone, tap **Add harness → Pair with a harness** and enter the
-   harness's WebSocket URL (`wss://host:port`), the pairing code, and the
-   certificate fingerprint shown alongside the code.
+   WebSocket URL, pairing code, and certificate fingerprint from the
+   sheet.
 3. The app generates a fresh Ed25519 key pair, registers the public key
    with the harness, and stores the private key in the platform keystore
    (Keychain on iOS/macOS, the Android keystore on Android). Later
@@ -88,8 +103,13 @@ or entered at pairing time for remote ones).
 **Web limitation:** browsers do not let page code inspect TLS certificates,
 so certificate pinning is not possible on the web build. The browser's
 normal certificate validation applies instead, which means a self-signed
-harness certificate is rejected. To use the web client, put the harness
-behind a certificate the browser trusts (for example a reverse proxy with a
+harness certificate is rejected until you accept it once: open
+`https://<host>:<port>/` in a tab and click through the certificate
+warning (the harness serves a confirmation page), then connect. The
+pairing sheet shows this address as a hint, and when a connection fails on
+the web build, the error banner repeats it as copyable text with a Retry
+button. For a setup without the warning, put the harness behind a
+certificate the browser trusts (for example a reverse proxy with a
 certificate from a real certificate authority).
 
 ## Security assumptions
@@ -122,4 +142,6 @@ Code layout:
   store, the persisted harness registry, secret storage, and local-harness
   discovery/spawning.
 - `lib/src/ui/` — home screen (harness list, add flows), chat screen
-  (transcript, question card, input row, access sheet, cost chip).
+  (transcript, question card, input row, access sheet, cost chip), and the
+  pairing sheet (`pairing_sheet.dart`, with its pure helpers in
+  `pairing_info.dart`).
