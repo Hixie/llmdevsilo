@@ -68,11 +68,15 @@ app probes.
    connections authenticate by signing a server-issued challenge; the
    pairing code is never needed again.
 
-Keychain access on macOS requires the `keychain-access-groups`
-entitlement, present in both `macos/Runner/DebugProfile.entitlements` and
-`macos/Runner/Release.entitlements`. Without it the keystore rejects every
-operation (security error -34018); the app then keeps settings in memory
-for the session and logs the failure instead of persisting.
+On macOS the app stores secrets in the legacy login keychain
+(`useDataProtectionKeyChain: false` in `lib/src/connection/secret_store.dart`).
+The modern data-protection keychain needs the `keychain-access-groups`
+entitlement, which only builds under real development signing; the legacy
+keychain works with Flutter's default ad-hoc signing, so `flutter run -d
+macos` needs no Apple developer account. Projects that adopt development
+signing can add the entitlement and flip the option back. If the keystore
+ever rejects operations anyway, the app keeps settings in memory for the
+session and logs the failure instead of crashing.
 
 ## TLS and certificate pinning
 

@@ -15,7 +15,14 @@ abstract class SecretStore {
 /// Secrets in the platform-native keystore: Keychain on macOS/iOS, the
 /// Android keystore, and browser storage (encrypted with WebCrypto) on web.
 class SecureSecretStore implements SecretStore {
-  SecureSecretStore() : _storage = const FlutterSecureStorage();
+  // The macOS data-protection keychain requires the keychain-access-groups
+  // entitlement, which only builds under real development signing. The
+  // legacy login keychain works with Flutter's default ad-hoc signing, so
+  // a plain `flutter run -d macos` needs no Apple developer account.
+  SecureSecretStore()
+      : _storage = const FlutterSecureStorage(
+          mOptions: MacOsOptions(useDataProtectionKeyChain: false),
+        );
 
   final FlutterSecureStorage _storage;
 
