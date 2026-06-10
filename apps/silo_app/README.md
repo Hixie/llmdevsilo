@@ -31,8 +31,28 @@ shared files, and cost reports.
 
 On macOS you can also use **Add harness → Start a local harness**: pick a
 workspace directory and the app runs `silo run --workspace <dir>` for you,
-then attaches to the run file once it appears. This requires `silo` to be
-on your `PATH`.
+then attaches to the run file once it appears. The dialog remembers every
+field across launches — including when it is cancelled or the app is
+closed — and prefills the last-used values the next time it opens. See the
+next section for how the app locates the `silo` binary.
+
+## How the app finds the `silo` binary
+
+The **Start a local harness** dialog has a **silo binary** field, prefilled
+with the first existing file among, in order:
+
+1. the path you last entered in that field (persisted across launches);
+2. the path in the `SILO_BIN` environment variable;
+3. `silo` in each directory on `PATH`;
+4. `~/.cargo/bin/silo`, `/opt/homebrew/bin/silo`, and `/usr/local/bin/silo`.
+
+You can edit the field before starting; the dialog shows the exact command
+it will run. Note that a GUI app launched from the Finder or the Dock does
+not inherit your shell's `PATH`, so the conventional locations in step 4
+matter more than they would in a terminal. If nothing is found, build silo
+with `cargo build --release` in the llmdevsilo repository and enter the
+path to `target/release/silo` in the field, or install silo somewhere the
+app probes.
 
 ## Pairing from a phone (or any remote client)
 

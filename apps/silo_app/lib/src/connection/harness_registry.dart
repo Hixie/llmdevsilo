@@ -8,10 +8,13 @@ import 'package:flutter/foundation.dart';
 
 import 'endpoint.dart';
 import 'harness_connection.dart';
+import 'local_harness_options.dart';
 import 'message_channel.dart';
 import 'secret_store.dart';
 
 const _registryKey = 'silo/registry';
+const _siloPathKey = 'silo/silo-path';
+const _lastLaunchKey = 'silo/last-launch-options';
 
 /// Holds the configured harness endpoints (persisted via the secret store)
 /// and one [HarnessConnection] per endpoint. Multiple connections can be
@@ -37,6 +40,18 @@ class HarnessRegistry extends ChangeNotifier {
   bool _loaded = false;
   bool get loaded => _loaded;
 
+  String? _siloPath;
+
+  /// User-configured path of the `silo` binary, persisted alongside the
+  /// endpoint list. Null when none has been saved.
+  String? get siloPath => _siloPath;
+
+  LocalHarnessFormState? _lastLaunchForm;
+
+  /// Field values of the last start-local-harness form, persisted so the
+  /// dialog can prefill them. Null when none has been saved.
+  LocalHarnessFormState? get lastLaunchForm => _lastLaunchForm;
+
   Future<void> load() async {
     final raw = await _secrets.read(_registryKey);
     _endpoints.clear();
@@ -45,7 +60,39 @@ class HarnessRegistry extends ChangeNotifier {
       _endpoints.addAll(list
           .map((e) => HarnessEndpoint.fromJson(e as Map<String, dynamic>)));
     }
+    _siloPath = await _secrets.read(_siloPathKey);
+    final lastLaunch = await _secrets.read(_lastLaunchKey);
+    _lastLaunchForm = null;
+    if (lastLaunch != null) {
+      try {
+        _lastLaunchForm = LocalHarnessFormState.fromJson(
+            jsonDecode(lastLaunch) as Map<String, dynamic>);
+      } catch (_) {
+        // An unreadable document is dropped; the dialog falls back to its
+        // defaults.
+      }
+    }
     _loaded = true;
+    notifyListeners();
+  }
+
+  /// Saves the `silo` binary path; an empty value clears it.
+  Future<void> setSiloPath(String path) async {
+    final trimmed = path.trim();
+    _siloPath = trimmed.isEmpty ? null : trimmed;
+    if (_siloPath == null) {
+      await _secrets.delete(_siloPathKey);
+    } else {
+      await _secrets.write(_siloPathKey, _siloPath!);
+    }
+    notifyListeners();
+  }
+
+  /// Saves the start-local-harness form state for the next opening of the
+  /// dialog.
+  Future<void> setLastLaunchForm(LocalHarnessFormState form) async {
+    _lastLaunchForm = form;
+    await _secrets.write(_lastLaunchKey, jsonEncode(form.toJson()));
     notifyListeners();
   }
 

@@ -44,6 +44,7 @@ enum SandboxChoice {
 class LocalHarnessOptions {
   const LocalHarnessOptions({
     required this.workspaceDir,
+    required this.siloBinary,
     this.createWorkspace = true,
     this.backend = LlmBackendChoice.anthropic,
     this.model = '',
@@ -56,6 +57,9 @@ class LocalHarnessOptions {
 
   /// Workspace directory passed to `--workspace`.
   final String workspaceDir;
+
+  /// Path of the `silo` binary to run.
+  final String siloBinary;
 
   /// Passes `--create` so the workspace is locked before the session.
   final bool createWorkspace;
@@ -80,6 +84,80 @@ class LocalHarnessOptions {
 
   /// Session dollar quota (`--quota-usd`); null omits the flag.
   final double? quotaUsd;
+}
+
+/// The raw field values of the start-local-harness form, persisted so the
+/// dialog can prefill the last-used values on its next opening, including
+/// values from a form that was dismissed without starting. Text fields are
+/// kept verbatim, so a half-typed entry survives as typed.
+class LocalHarnessFormState {
+  const LocalHarnessFormState({
+    this.workspaceDir = '',
+    this.siloPath = '',
+    this.backend = LlmBackendChoice.anthropic,
+    this.model = '',
+    this.apiKeyEnv = '',
+    this.sandbox = SandboxChoice.auto,
+    this.domainsText = '',
+    this.readAllowlistText = '',
+    this.quotaText = '',
+  });
+
+  factory LocalHarnessFormState.fromJson(Map<String, dynamic> json) =>
+      LocalHarnessFormState(
+        workspaceDir: json['workspaceDir'] as String? ?? '',
+        siloPath: json['siloPath'] as String? ?? '',
+        backend: LlmBackendChoice.values.firstWhere(
+          (backend) => backend.cliName == json['backend'],
+          orElse: () => LlmBackendChoice.anthropic,
+        ),
+        model: json['model'] as String? ?? '',
+        apiKeyEnv: json['apiKeyEnv'] as String? ?? '',
+        sandbox: SandboxChoice.values.firstWhere(
+          (sandbox) => sandbox.cliName == json['sandbox'],
+          orElse: () => SandboxChoice.auto,
+        ),
+        domainsText: json['domainsText'] as String? ?? '',
+        readAllowlistText: json['readAllowlistText'] as String? ?? '',
+        quotaText: json['quotaText'] as String? ?? '',
+      );
+
+  /// Workspace directory field text.
+  final String workspaceDir;
+
+  /// Silo binary field text.
+  final String siloPath;
+
+  final LlmBackendChoice backend;
+
+  /// Model field text.
+  final String model;
+
+  /// API key environment variable field text.
+  final String apiKeyEnv;
+
+  final SandboxChoice sandbox;
+
+  /// Allowed-domains field text, one entry per line.
+  final String domainsText;
+
+  /// Read-allowlist field text, one entry per line.
+  final String readAllowlistText;
+
+  /// Dollar quota field text.
+  final String quotaText;
+
+  Map<String, dynamic> toJson() => {
+        'workspaceDir': workspaceDir,
+        'siloPath': siloPath,
+        'backend': backend.cliName,
+        'model': model,
+        'apiKeyEnv': apiKeyEnv,
+        'sandbox': sandbox.cliName,
+        'domainsText': domainsText,
+        'readAllowlistText': readAllowlistText,
+        'quotaText': quotaText,
+      };
 }
 
 /// The argument list for the `silo` binary built from [options].
@@ -111,7 +189,7 @@ List<String> buildRunArgs(LocalHarnessOptions options) => [
 /// The full command line for [options], shell-quoted for display and for
 /// copy-pasting into a terminal.
 String runCommandLine(LocalHarnessOptions options) =>
-    ['silo', ...buildRunArgs(options)].map(shellQuote).join(' ');
+    [options.siloBinary, ...buildRunArgs(options)].map(shellQuote).join(' ');
 
 final RegExp _shellSafe = RegExp(r'^[A-Za-z0-9_\-./:=@%+,]+$');
 

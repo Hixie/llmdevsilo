@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:silo_app/src/connection/local_harness_options.dart';
 
@@ -6,6 +8,7 @@ void main() {
     test('minimal options produce a create-locked anthropic run', () {
       final args = buildRunArgs(const LocalHarnessOptions(
         workspaceDir: '/tmp/ws',
+        siloBinary: '/usr/local/bin/silo',
         model: 'claude-sonnet-4-6',
         apiKeyEnv: 'ANTHROPIC_API_KEY',
       ));
@@ -28,6 +31,7 @@ void main() {
     test('createWorkspace false omits --create', () {
       final args = buildRunArgs(const LocalHarnessOptions(
         workspaceDir: '/tmp/ws',
+        siloBinary: '/usr/local/bin/silo',
         createWorkspace: false,
       ));
       expect(args, isNot(contains('--create')));
@@ -43,6 +47,7 @@ void main() {
       for (final backend in LlmBackendChoice.values) {
         final args = buildRunArgs(LocalHarnessOptions(
           workspaceDir: '/tmp/ws',
+          siloBinary: '/usr/local/bin/silo',
           backend: backend,
         ));
         final llmIndex = args.indexOf('--llm');
@@ -62,6 +67,7 @@ void main() {
     test('empty model and API key env omit their flags', () {
       final args = buildRunArgs(const LocalHarnessOptions(
         workspaceDir: '/tmp/ws',
+        siloBinary: '/usr/local/bin/silo',
         backend: LlmBackendChoice.local,
       ));
       expect(args, isNot(contains('--model')));
@@ -75,6 +81,7 @@ void main() {
       ]) {
         final args = buildRunArgs(LocalHarnessOptions(
           workspaceDir: '/tmp/ws',
+          siloBinary: '/usr/local/bin/silo',
           sandbox: choice,
         ));
         final index = args.indexOf('--sandbox');
@@ -85,6 +92,7 @@ void main() {
     test('domains expand to repeated --allow-domain flags in order', () {
       final args = buildRunArgs(const LocalHarnessOptions(
         workspaceDir: '/tmp/ws',
+        siloBinary: '/usr/local/bin/silo',
         allowedDomains: ['api.example.com', '*.docs.example.com'],
       ));
       expect(
@@ -97,6 +105,7 @@ void main() {
     test('read allowlist expands to repeated --allow-read flags', () {
       final args = buildRunArgs(const LocalHarnessOptions(
         workspaceDir: '/tmp/ws',
+        siloBinary: '/usr/local/bin/silo',
         readAllowlist: ['/opt/sdk', '/usr/share/doc'],
       ));
       expect(
@@ -108,6 +117,7 @@ void main() {
     test('dollar quota maps to --quota-usd and is omitted when null', () {
       final withQuota = buildRunArgs(const LocalHarnessOptions(
         workspaceDir: '/tmp/ws',
+        siloBinary: '/usr/local/bin/silo',
         quotaUsd: 2.5,
       ));
       final index = withQuota.indexOf('--quota-usd');
@@ -116,18 +126,20 @@ void main() {
 
       final withoutQuota = buildRunArgs(const LocalHarnessOptions(
         workspaceDir: '/tmp/ws',
+        siloBinary: '/usr/local/bin/silo',
       ));
       expect(withoutQuota, isNot(contains('--quota-usd')));
     });
   });
 
   group('runCommandLine', () {
-    test('starts with silo run and quotes spaced values', () {
+    test('starts with the silo binary and quotes spaced values', () {
       final line = runCommandLine(const LocalHarnessOptions(
         workspaceDir: '/tmp/my ws',
+        siloBinary: '/usr/local/bin/silo',
         model: 'claude-sonnet-4-6',
       ));
-      expect(line, startsWith('silo run --workspace '));
+      expect(line, startsWith('/usr/local/bin/silo run --workspace '));
       expect(line, contains("'/tmp/my ws'"));
     });
 
@@ -145,6 +157,45 @@ void main() {
         ['api.example.com', '*.docs.example.com'],
       );
       expect(splitLines(''), isEmpty);
+    });
+  });
+
+  group('LocalHarnessFormState', () {
+    test('round-trips through JSON', () {
+      const form = LocalHarnessFormState(
+        workspaceDir: '/tmp/ws',
+        siloPath: '/usr/local/bin/silo',
+        backend: LlmBackendChoice.openai,
+        model: 'gpt-5',
+        apiKeyEnv: 'OPENAI_API_KEY',
+        sandbox: SandboxChoice.mock,
+        domainsText: 'api.example.com\n*.docs.example.com',
+        readAllowlistText: '/opt/sdk\n/usr/share/doc',
+        quotaText: '2.5',
+      );
+      final restored = LocalHarnessFormState.fromJson(
+          jsonDecode(jsonEncode(form.toJson())) as Map<String, dynamic>);
+      expect(restored.workspaceDir, form.workspaceDir);
+      expect(restored.siloPath, form.siloPath);
+      expect(restored.backend, form.backend);
+      expect(restored.model, form.model);
+      expect(restored.apiKeyEnv, form.apiKeyEnv);
+      expect(restored.sandbox, form.sandbox);
+      expect(restored.domainsText, form.domainsText);
+      expect(restored.readAllowlistText, form.readAllowlistText);
+      expect(restored.quotaText, form.quotaText);
+    });
+
+    test('missing or unknown values fall back to the defaults', () {
+      final restored = LocalHarnessFormState.fromJson({
+        'backend': 'no-such-backend',
+        'sandbox': 'no-such-sandbox',
+      });
+      expect(restored.workspaceDir, '');
+      expect(restored.siloPath, '');
+      expect(restored.backend, LlmBackendChoice.anthropic);
+      expect(restored.sandbox, SandboxChoice.auto);
+      expect(restored.quotaText, '');
     });
   });
 

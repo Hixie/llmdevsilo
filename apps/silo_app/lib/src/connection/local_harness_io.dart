@@ -12,6 +12,7 @@ import 'dart:io';
 
 import '../protocol/protocol.dart';
 import 'local_harness_options.dart';
+import 'silo_locator.dart';
 
 /// True when run-file discovery is available (desktop platforms).
 bool get localRunsSupported =>
@@ -19,6 +20,17 @@ bool get localRunsSupported =>
 
 /// True when the app can spawn a new local harness (macOS desktop).
 bool get canSpawnHarness => Platform.isMacOS;
+
+/// The first existing `silo` binary, probing [configuredPath], `SILO_BIN`,
+/// `PATH`, and the conventional install locations. Null when none exists.
+String? resolveSiloBinary(String? configuredPath) => locateSilo(
+      configuredPath: configuredPath,
+      environment: Platform.environment,
+      fileExists: siloBinaryExists,
+    );
+
+/// True when a file exists at [path].
+bool siloBinaryExists(String path) => File(path).existsSync();
 
 String stateDir() {
   final override = Platform.environment['LLMDEVSILO_STATE_DIR'];
@@ -81,26 +93,35 @@ Future<bool> isWorkspaceLocked(String dir) async {
 
 const _stderrTailLines = 40;
 
-/// Starts `silo run` with the arguments built from [options] and waits for
-/// its run file to appear. The process is detached so it outlives the app,
-/// with stdio pipes kept so startup errors are readable. Returns the new
-/// harness's `RunInfo`, or null when the process is still running at
-/// [timeout]. Throws [HarnessStartError] when the process cannot be
-/// spawned or exits before its run file appears, with the stderr tail.
+/// Starts `silo run` with the binary and arguments from [options] and
+/// waits for its run file to appear. The process is detached so it outlives
+/// the app, with stdio pipes kept so startup errors are readable. Returns
+/// the new harness's `RunInfo`, or null when the process is still running
+/// at [timeout]. Throws [HarnessStartError] when the binary is missing,
+/// the process cannot be spawned, or it exits before its run file appears,
+/// with the stderr tail.
 Future<RunInfo?> startLocalHarness(
   LocalHarnessOptions options, {
   Duration timeout = const Duration(seconds: 30),
 }) async {
+  if (!siloBinaryExists(options.siloBinary)) {
+    throw HarnessStartError(
+      'There is no file at "${options.siloBinary}". $siloNotFoundMessage',
+    );
+  }
   final before = {for (final r in await listLocalRuns()) r.harnessId};
   final Process process;
   try {
     process = await Process.start(
-      'silo',
+      options.siloBinary,
       buildRunArgs(options),
       mode: ProcessStartMode.detachedWithStdio,
     );
   } on ProcessException catch (error) {
-    throw HarnessStartError('Could not start "silo": ${error.message}');
+    throw HarnessStartError(
+      'Could not start "${options.siloBinary}": ${error.message}. '
+      '$siloNotFoundMessage',
+    );
   }
   // Detached processes expose no exit code; the stderr stream closing
   // signals that the process has exited. Keep the last lines for error

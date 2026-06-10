@@ -12,6 +12,7 @@ import '../connection/harness_connection.dart';
 import '../connection/harness_registry.dart';
 import '../connection/local_harness.dart' as local;
 import '../connection/local_harness_options.dart';
+import '../connection/silo_locator.dart';
 import '../protocol/protocol.dart';
 import 'chat_screen.dart';
 
@@ -113,11 +114,26 @@ class HomeScreen extends StatelessWidget {
   Future<void> _startLocal(BuildContext context) async {
     final registry = context.read<HarnessRegistry>();
     final messenger = ScaffoldMessenger.of(context);
+    LocalHarnessFormState? form = registry.lastLaunchForm;
     final options = await showDialog<LocalHarnessOptions>(
       context: context,
-      builder: (_) => const StartLocalDialog(),
+      builder: (_) => StartLocalDialog(
+        initialSiloPath: registry.siloPath,
+        initialForm: form,
+        onFormChanged: (state) => form = state,
+      ),
     );
+    // The form state is saved on every outcome, so a form dismissed
+    // without starting is restored on the next opening.
+    final latestForm = form;
+    if (latestForm != null) {
+      await registry.setLastLaunchForm(latestForm);
+    }
     if (options == null || !context.mounted) {
+      return;
+    }
+    await registry.setSiloPath(options.siloBinary);
+    if (!context.mounted) {
       return;
     }
     messenger.showSnackBar(
@@ -137,8 +153,7 @@ class HomeScreen extends StatelessWidget {
     }
     if (run == null) {
       messenger.showSnackBar(const SnackBar(
-        content: Text(
-            'The harness did not come up. Is "silo" on your PATH?'),
+        content: Text('The harness did not come up in time.'),
       ));
       return;
     }
@@ -478,6 +493,11 @@ class StartLocalDialog extends StatefulWidget {
     super.key,
     this.pickDirectory,
     this.isWorkspaceLocked,
+    this.initialSiloPath,
+    this.initialForm,
+    this.onFormChanged,
+    this.resolveSilo,
+    this.siloExists,
   });
 
   /// Directory picker; defaults to the platform file selector.
@@ -487,12 +507,36 @@ class StartLocalDialog extends StatefulWidget {
   /// reading the workspace registry.
   final Future<bool> Function(String dir)? isWorkspaceLocked;
 
+  /// Previously saved `silo` binary path, fed to the resolver to prefill
+  /// the silo binary field. A non-empty [initialForm] silo path takes
+  /// precedence.
+  final String? initialSiloPath;
+
+  /// Previously saved form state; when present, every field is prefilled
+  /// from it.
+  final LocalHarnessFormState? initialForm;
+
+  /// Called with the current form state on every field change. The opener
+  /// keeps the latest value and persists it once the dialog closes, so
+  /// the state survives a cancel or dismiss as well as a start.
+  final ValueChanged<LocalHarnessFormState>? onFormChanged;
+
+  /// Resolves the `silo` binary path from an optional configured path;
+  /// defaults to probing `SILO_BIN`, `PATH`, and the conventional install
+  /// locations.
+  final String? Function(String? configuredPath)? resolveSilo;
+
+  /// File-exists probe for the silo binary field; defaults to the
+  /// filesystem.
+  final bool Function(String path)? siloExists;
+
   @override
   State<StartLocalDialog> createState() => _StartLocalDialogState();
 }
 
 class _StartLocalDialogState extends State<StartLocalDialog> {
   final _dir = TextEditingController();
+  late final TextEditingController _silo;
   final _model =
       TextEditingController(text: LlmBackendChoice.anthropic.defaultModel);
   final _apiKeyEnv =
@@ -509,16 +553,41 @@ class _StartLocalDialogState extends State<StartLocalDialog> {
   @override
   void initState() {
     super.initState();
-    for (final controller in [_dir, _model, _apiKeyEnv, _domains, _allowRead]) {
-      controller.addListener(_refresh);
+    final form = widget.initialForm;
+    final resolve = widget.resolveSilo ?? local.resolveSiloBinary;
+    final savedSilo = form?.siloPath ?? '';
+    final configured =
+        savedSilo.isNotEmpty ? savedSilo : widget.initialSiloPath;
+    _silo = TextEditingController(text: resolve(configured) ?? savedSilo);
+    if (form != null) {
+      _dir.text = form.workspaceDir;
+      _model.text = form.model;
+      _apiKeyEnv.text = form.apiKeyEnv;
+      _domains.text = form.domainsText;
+      _allowRead.text = form.readAllowlistText;
+      _quota.text = form.quotaText;
+      _backend = form.backend;
+      _sandbox = form.sandbox;
+    }
+    for (final controller in [
+      _dir,
+      _silo,
+      _model,
+      _apiKeyEnv,
+      _domains,
+      _allowRead,
+    ]) {
+      controller.addListener(_fieldChanged);
     }
     _dir.addListener(_updateCreate);
-    _quota.addListener(_refresh);
+    _quota.addListener(_fieldChanged);
+    _updateCreate();
   }
 
   @override
   void dispose() {
     _dir.dispose();
+    _silo.dispose();
     _model.dispose();
     _apiKeyEnv.dispose();
     _domains.dispose();
@@ -527,7 +596,35 @@ class _StartLocalDialogState extends State<StartLocalDialog> {
     super.dispose();
   }
 
+  /// True when the silo binary field holds the path of an existing file.
+  bool get _siloFound {
+    final path = _silo.text.trim();
+    if (path.isEmpty) {
+      return false;
+    }
+    return (widget.siloExists ?? local.siloBinaryExists)(path);
+  }
+
   void _refresh() => setState(() {});
+
+  void _fieldChanged() {
+    widget.onFormChanged?.call(_formState);
+    _refresh();
+  }
+
+  /// The current field values, as handed to [StartLocalDialog.onFormChanged]
+  /// for persistence.
+  LocalHarnessFormState get _formState => LocalHarnessFormState(
+        workspaceDir: _dir.text,
+        siloPath: _silo.text,
+        backend: _backend,
+        model: _model.text,
+        apiKeyEnv: _apiKeyEnv.text,
+        sandbox: _sandbox,
+        domainsText: _domains.text,
+        readAllowlistText: _allowRead.text,
+        quotaText: _quota.text,
+      );
 
   /// Checks whether the chosen directory is already a locked workspace and
   /// drops `--create` when it is.
@@ -564,13 +661,15 @@ class _StartLocalDialogState extends State<StartLocalDialog> {
       }
       _backend = backend;
     });
+    widget.onFormChanged?.call(_formState);
   }
 
   /// The options composed from the current form fields. Null while the
-  /// workspace directory is empty or the quota does not parse.
+  /// workspace directory is empty, the silo binary field does not point at
+  /// an existing file, or the quota does not parse.
   LocalHarnessOptions? get _options {
     final dir = _dir.text.trim();
-    if (dir.isEmpty) {
+    if (dir.isEmpty || !_siloFound) {
       return null;
     }
     final quotaText = _quota.text.trim();
@@ -583,6 +682,7 @@ class _StartLocalDialogState extends State<StartLocalDialog> {
     }
     return LocalHarnessOptions(
       workspaceDir: dir,
+      siloBinary: _silo.text.trim(),
       createWorkspace: _create,
       backend: _backend,
       model: _model.text.trim(),
@@ -639,6 +739,15 @@ class _StartLocalDialogState extends State<StartLocalDialog> {
                 ],
               ),
               const SizedBox(height: 12),
+              TextField(
+                controller: _silo,
+                decoration: InputDecoration(
+                  labelText: 'silo binary',
+                  errorText: _siloFound ? null : siloNotFoundMessage,
+                  errorMaxLines: 4,
+                ),
+              ),
+              const SizedBox(height: 12),
               DropdownButtonFormField<LlmBackendChoice>(
                 initialValue: _backend,
                 decoration: const InputDecoration(labelText: 'LLM backend'),
@@ -681,6 +790,7 @@ class _StartLocalDialogState extends State<StartLocalDialog> {
                 onChanged: (sandbox) {
                   if (sandbox != null) {
                     setState(() => _sandbox = sandbox);
+                    widget.onFormChanged?.call(_formState);
                   }
                 },
               ),

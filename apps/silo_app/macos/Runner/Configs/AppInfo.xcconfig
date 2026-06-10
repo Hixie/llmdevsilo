@@ -5,7 +5,7 @@
 // 'flutter create' template.
 
 // The application's name. By default this is also the title of the Flutter window.
-PRODUCT_NAME = silo_app
+PRODUCT_NAME = Silo
 
 // The application's bundle identifier
 PRODUCT_BUNDLE_IDENTIFIER = tools.common.siloApp

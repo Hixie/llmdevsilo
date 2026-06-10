@@ -9,6 +9,10 @@ bool get localRunsSupported => false;
 
 bool get canSpawnHarness => false;
 
+String? resolveSiloBinary(String? configuredPath) => null;
+
+bool siloBinaryExists(String path) => false;
+
 String stateDir() => '';
 
 Future<List<RunInfo>> listLocalRuns() async => [];

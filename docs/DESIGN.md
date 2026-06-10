@@ -11,11 +11,11 @@ Premise: Existing LLMs/agents are powerful tools for coding, both in terms of po
   * ability to install and run new programs (within the sandbox).
   * ability to run native code (e.g. macOS programs on macs, Linux programs on Linux).
 * The attack vectors (how the model can be misaligned with the user) are:
-  * prompt injection in third-party documentation: the model reads content from a dependency, or information on a web page like reddit or StackOverflow, that misguides it towards goals the user doesn't want.
-  * latent triggers in the model itself: the model was trained on tainted data that has left an undetected, undocumented, or just unexpected trigger that will lead it to behave against the user's goals in certain circumstances.
-  * misalignment in the model training: the model was trained, intentionally or not, to pursue goals that are at odds with the user's.
+  * [prompt injection in third-party documentation](https://x.com/sarahwooders/status/2043851764542386449): the model reads content from a dependency, or information on a web page like reddit or StackOverflow, that misguides it towards goals the user doesn't want.
+  * [latent triggers in the model itself](https://arxiv.org/pdf/2510.07192): the model was trained on tainted data that has left an undetected, undocumented, or just unexpected trigger that will lead it to behave against the user's goals in certain circumstances.
+  * [misalignment in the model training](https://arxiv.org/pdf/2509.15541): the model was trained, intentionally or not, to pursue goals that are at odds with the user's.
   * mistakes in user input: the user can give guidance that is ambiguous or otherwise doesn't reflect the user's intent (e.g. a typo changing "not" to "now").
-  * permission request fatigue: human users quickly tire of checking for potential risks and therefore permission requests are not a viable security policy.
+  * [permission request fatigue](https://grith.ai/blog/permission-fatigue-security-failure): human users quickly tire of checking for potential risks and therefore permission requests [are not a viable security policy](https://cups.cs.cmu.edu/soups/2012/proceedings/a3_Felt.pdf).
 * The attack payloads (potential bad effects that these attack vectors might trigger) that we want to statically mitigate are:
   * Permanent damage to the user's file system, e.g. deleting the home directory.
   * Permanent hardware damage outside of normal wear and tear (e.g. triggering a battery fire is in scope; worsening battery performance due to heavy CPU use is not).
