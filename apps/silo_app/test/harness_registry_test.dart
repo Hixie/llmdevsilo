@@ -91,5 +91,51 @@ void main() {
       expect(registry.lastLaunchForm, isNull);
       expect(registry.loaded, isTrue);
     });
+
+    test('preference persistence survives a broken secret store', () async {
+      final registry = HarnessRegistry(secrets: _ThrowingSecretStore());
+
+      // A keystore that rejects every operation (e.g. a missing macOS
+      // keychain entitlement) must not crash loading or preference saves;
+      // the values stay usable in memory for the session.
+      await registry.load();
+      expect(registry.loaded, isTrue);
+
+      await registry.setSiloPath('/opt/silo/bin/silo');
+      expect(registry.siloPath, '/opt/silo/bin/silo');
+
+      final form = LocalHarnessFormState(
+        workspaceDir: '/tmp/ws',
+        siloPath: '/opt/silo/bin/silo',
+        backend: LlmBackendChoice.anthropic,
+        model: 'claude-sonnet-4-6',
+        apiKeyEnv: 'ANTHROPIC_API_KEY',
+        sandbox: SandboxChoice.auto,
+        domainsText: '',
+        readAllowlistText: '',
+        quotaText: '',
+      );
+      await registry.setLastLaunchForm(form);
+      expect(registry.lastLaunchForm, same(form));
+    });
   });
+}
+
+/// Secret store whose every operation fails, like a keystore without the
+/// required platform entitlement.
+class _ThrowingSecretStore implements SecretStore {
+  @override
+  Future<String?> read(String key) async {
+    throw Exception('secret store unavailable');
+  }
+
+  @override
+  Future<void> write(String key, String value) async {
+    throw Exception('secret store unavailable');
+  }
+
+  @override
+  Future<void> delete(String key) async {
+    throw Exception('secret store unavailable');
+  }
 }

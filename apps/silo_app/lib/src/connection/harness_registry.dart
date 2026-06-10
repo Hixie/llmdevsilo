@@ -52,16 +52,27 @@ class HarnessRegistry extends ChangeNotifier {
   /// dialog can prefill them. Null when none has been saved.
   LocalHarnessFormState? get lastLaunchForm => _lastLaunchForm;
 
+  /// Reads a key, treating storage failures as absent values so a broken
+  /// keystore degrades to defaults instead of preventing startup.
+  Future<String?> _tryRead(String key) async {
+    try {
+      return await _secrets.read(key);
+    } catch (error) {
+      debugPrint('secret store read of $key failed: $error');
+      return null;
+    }
+  }
+
   Future<void> load() async {
-    final raw = await _secrets.read(_registryKey);
+    final raw = await _tryRead(_registryKey);
     _endpoints.clear();
     if (raw != null) {
       final list = jsonDecode(raw) as List<dynamic>;
       _endpoints.addAll(list
           .map((e) => HarnessEndpoint.fromJson(e as Map<String, dynamic>)));
     }
-    _siloPath = await _secrets.read(_siloPathKey);
-    final lastLaunch = await _secrets.read(_lastLaunchKey);
+    _siloPath = await _tryRead(_siloPathKey);
+    final lastLaunch = await _tryRead(_lastLaunchKey);
     _lastLaunchForm = null;
     if (lastLaunch != null) {
       try {
@@ -80,19 +91,29 @@ class HarnessRegistry extends ChangeNotifier {
   Future<void> setSiloPath(String path) async {
     final trimmed = path.trim();
     _siloPath = trimmed.isEmpty ? null : trimmed;
-    if (_siloPath == null) {
-      await _secrets.delete(_siloPathKey);
-    } else {
-      await _secrets.write(_siloPathKey, _siloPath!);
+    // Preference persistence is best-effort: a keystore failure keeps the
+    // value for this session and logs instead of crashing.
+    try {
+      if (_siloPath == null) {
+        await _secrets.delete(_siloPathKey);
+      } else {
+        await _secrets.write(_siloPathKey, _siloPath!);
+      }
+    } catch (error) {
+      debugPrint('saving the silo path failed: $error');
     }
     notifyListeners();
   }
 
   /// Saves the start-local-harness form state for the next opening of the
-  /// dialog.
+  /// dialog. Best-effort like [setSiloPath].
   Future<void> setLastLaunchForm(LocalHarnessFormState form) async {
     _lastLaunchForm = form;
-    await _secrets.write(_lastLaunchKey, jsonEncode(form.toJson()));
+    try {
+      await _secrets.write(_lastLaunchKey, jsonEncode(form.toJson()));
+    } catch (error) {
+      debugPrint('saving the launch form failed: $error');
+    }
     notifyListeners();
   }
 

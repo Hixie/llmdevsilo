@@ -68,6 +68,12 @@ app probes.
    connections authenticate by signing a server-issued challenge; the
    pairing code is never needed again.
 
+Keychain access on macOS requires the `keychain-access-groups`
+entitlement, present in both `macos/Runner/DebugProfile.entitlements` and
+`macos/Runner/Release.entitlements`. Without it the keystore rejects every
+operation (security error -34018); the app then keeps settings in memory
+for the session and logs the failure instead of persisting.
+
 ## TLS and certificate pinning
 
 The harness uses a self-signed TLS certificate. On desktop and mobile the
