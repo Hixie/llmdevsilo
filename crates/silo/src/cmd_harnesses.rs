@@ -62,7 +62,7 @@ fn display(path: &Path) -> String {
 }
 
 /// Checks process liveness with `kill -0`.
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(std::process::Stdio::null())

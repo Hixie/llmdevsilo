@@ -30,6 +30,7 @@ pub fn execute(action: WorkspaceAction) -> anyhow::Result<u8> {
                 Some(id) => println!("attached: harness {id}"),
                 None => println!("attached: no"),
             }
+            println!("shells: {}", status.live_shells);
             for warning in &status.warnings {
                 println!("warning: {warning}");
             }

@@ -9,6 +9,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use silo_core::error::WorkspaceError;
@@ -204,6 +205,52 @@ pub(crate) fn hdiutil_detach_args(mountpoint: &Path) -> Vec<String> {
     vec!["detach".into(), mountpoint.display().to_string()]
 }
 
+/// True when `path` is a live mountpoint: it is a directory whose device
+/// id differs from its parent's. A missing path is not a mountpoint.
+#[cfg(unix)]
+pub(crate) fn is_mountpoint(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_dir() {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    let Ok(parent_meta) = fs::metadata(parent) else {
+        return false;
+    };
+    meta.dev() != parent_meta.dev()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_mountpoint(_path: &Path) -> bool {
+    false
+}
+
+/// Detaches the image mounted at `mountpoint`. An unmounted mountpoint is
+/// a no-op. A failed detach is retried once with `-force` after a short
+/// wait; a second failure is returned.
+pub(crate) fn detach_image(mountpoint: &Path) -> Result<(), WorkspaceError> {
+    if !is_mountpoint(mountpoint) {
+        return Ok(());
+    }
+    if run_hdiutil(&hdiutil_detach_args(mountpoint)).is_ok() {
+        return Ok(());
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let mut force_args = hdiutil_detach_args(mountpoint);
+    force_args.push("-force".into());
+    run_hdiutil(&force_args).map_err(|e| {
+        WorkspaceError::Setup(format!(
+            "cannot detach the workspace image at {} (retried with -force): {e}",
+            mountpoint.display()
+        ))
+    })
+}
+
 pub(crate) fn run_hdiutil(args: &[String]) -> Result<(), WorkspaceError> {
     let output = Command::new("hdiutil")
         .args(args)
@@ -241,22 +288,29 @@ pub(crate) fn lock_into_sparsebundle(
 /// Removes any partial sparse bundle state after a failed lock attempt.
 pub(crate) fn cleanup_sparsebundle(workspace_dir: &Path) {
     let (bundle, mountpoint) = sparsebundle_paths(workspace_dir);
-    let _ = run_hdiutil(&hdiutil_detach_args(&mountpoint));
+    let _ = detach_image(&mountpoint);
     let _ = fs::remove_dir_all(&bundle);
-    let _ = fs::remove_dir_all(&mountpoint);
+    if !is_mountpoint(&mountpoint) {
+        let _ = fs::remove_dir_all(&mountpoint);
+    }
 }
 
-/// Mounts the sparse bundle, copies the contents back out, and unmounts.
+/// Mounts the sparse bundle (a no-op when it is already mounted), copies
+/// the contents back out, and unmounts. Both a copy failure and a detach
+/// failure are returned.
 pub(crate) fn restore_from_sparsebundle(
     workspace_dir: &Path,
     dest: &Path,
 ) -> Result<(), WorkspaceError> {
     let (bundle, mountpoint) = sparsebundle_paths(workspace_dir);
     fs::create_dir_all(&mountpoint)?;
-    run_hdiutil(&hdiutil_attach_args(&bundle, &mountpoint))?;
+    if !is_mountpoint(&mountpoint) {
+        run_hdiutil(&hdiutil_attach_args(&bundle, &mountpoint))?;
+    }
     let copy_result = copy_contents_excluding(&mountpoint, dest, VOLUME_METADATA);
-    let _ = run_hdiutil(&hdiutil_detach_args(&mountpoint));
+    let detach_result = detach_image(&mountpoint);
     copy_result?;
+    detach_result?;
     Ok(())
 }
 
@@ -398,6 +452,24 @@ mod tests {
 
         remove_marker(&dir);
         assert!(!dir.join(MARKER_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn mountpoint_probe_distinguishes_mounts_from_plain_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!is_mountpoint(temp.path()));
+        assert!(!is_mountpoint(&temp.path().join("missing")));
+        let file = temp.path().join("file");
+        fs::write(&file, "x").unwrap();
+        assert!(!is_mountpoint(&file));
+        assert!(is_mountpoint(Path::new("/")));
+    }
+
+    #[test]
+    fn detaching_an_unmounted_mountpoint_is_a_no_op() {
+        let temp = tempfile::tempdir().unwrap();
+        detach_image(temp.path()).unwrap();
+        detach_image(&temp.path().join("missing")).unwrap();
     }
 
     #[test]

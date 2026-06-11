@@ -87,6 +87,17 @@ because anything malicious it planted is still confined):
 target/release/silo shell --workspace ~/dev/myproject --allow-read /usr/bin
 ```
 
+This works while a harness is running in the workspace: the shell shares
+the workspace mount, so you can inspect the agent's work live. When the
+harness is running and you pass no sandbox flags, the shell mirrors the
+harness's access policy by default — the same sandbox kind, the same
+read allowlist, and the same allowed domains, read from the harness's
+run file. Explicit `--allow-read`, `--allow-domain`, or `--sandbox`
+flags always win (with a printed note that the shell's policy differs
+from the harness's). Credential injection is never mirrored: only
+credentials you pass to the shell with `--inject-credential` are
+injected.
+
 Pair a phone or another machine: in any connected client request a pairing
 code (TUI: `/pair`), or start the harness with `--pairing-code`. Enter the
 address, code, and certificate fingerprint in the remote client; it

@@ -41,6 +41,7 @@ async fn start_mock(
         access: AccessReport::default(),
         state_dir: std::env::temp_dir(),
         workspace: "/tmp/ws".into(),
+        configured_read_allowlist: Vec::new(),
     };
     frontend.start(ctx).await.unwrap();
     (frontend, commands_rx)

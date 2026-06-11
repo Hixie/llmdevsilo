@@ -55,10 +55,15 @@ fn test_context(
         access: AccessReport {
             sandbox_kind: "mock".into(),
             workspace_mount: "/workspace".into(),
+            readable_paths: vec!["/usr/bin".into()],
+            allowed_domains: vec!["example.com".into()],
             ..AccessReport::default()
         },
         state_dir: state_dir.path().to_path_buf(),
         workspace: "/tmp/ws".into(),
+        // Deliberately different from the access report's expanded
+        // readable_paths: the run file must carry the configured list.
+        configured_read_allowlist: vec!["/opt/tools".into()],
     }
 }
 
@@ -814,4 +819,15 @@ async fn interactive_tool_defs_are_question_and_file() {
         .map(|d| d.name)
         .collect();
     assert_eq!(names, vec!["AskUserQuestion", "SendUserFile"]);
+}
+
+#[tokio::test]
+async fn run_file_carries_the_sandbox_policy() {
+    let mut server = boot().await;
+    assert_eq!(server.run.sandbox_kind.as_deref(), Some("mock"));
+    // The run file carries the configured read allowlist, not the access
+    // report's expanded readable paths.
+    assert_eq!(server.run.read_allowlist, vec!["/opt/tools".to_string()]);
+    assert_eq!(server.run.allowed_domains, vec!["example.com".to_string()]);
+    server.frontend.shutdown(None).await.unwrap();
 }

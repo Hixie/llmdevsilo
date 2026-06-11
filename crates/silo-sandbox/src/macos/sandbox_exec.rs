@@ -60,6 +60,9 @@ struct Running {
     child: Child,
     /// Environment shared by the helper and user shells.
     env: Vec<(String, String)>,
+    /// Process group of a live user shell; `terminate_user_shell` signals
+    /// it.
+    shell_pgid: std::sync::Mutex<Option<i32>>,
 }
 
 struct SandboxExecBackend {
@@ -249,6 +252,7 @@ impl Sandbox for SandboxExecBackend {
             session,
             child,
             env,
+            shell_pgid: std::sync::Mutex::new(None),
         });
         Ok(())
     }
@@ -346,10 +350,19 @@ impl Sandbox for SandboxExecBackend {
         if let Ok(term) = std::env::var("TERM") {
             cmd.env("TERM", term);
         }
-        let status = cmd
-            .status()
-            .await
+        // The shell runs as the leader of its own process group, so the
+        // whole session can be terminated as a unit.
+        cmd.process_group(0);
+        let mut child = cmd
+            .spawn()
             .map_err(|e| SandboxError::Setup(format!("cannot spawn user shell: {e}")))?;
+        if let Some(pid) = child.id() {
+            *running.shell_pgid.lock().expect("shell pgid poisoned") = Some(pid as i32);
+        }
+        let status = child.wait().await;
+        *running.shell_pgid.lock().expect("shell pgid poisoned") = None;
+        let status =
+            status.map_err(|e| SandboxError::Setup(format!("cannot wait for user shell: {e}")))?;
         if let Some(code) = status.code() {
             return Ok(code);
         }
@@ -361,6 +374,17 @@ impl Sandbox for SandboxExecBackend {
             }
         }
         Ok(-1)
+    }
+
+    async fn terminate_user_shell(&self) -> Result<(), SandboxError> {
+        let Some(running) = &self.running else {
+            return Ok(());
+        };
+        let pgid = *running.shell_pgid.lock().expect("shell pgid poisoned");
+        if let Some(pgid) = pgid {
+            crate::terminate_process_group(pgid).await;
+        }
+        Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<(), SandboxError> {

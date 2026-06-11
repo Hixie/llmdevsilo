@@ -960,7 +960,10 @@ shutdown.
   "cert_fingerprint_sha256": "9f2c41e87b…64 lowercase hex characters…",
   "local_token_path": "/Users/me/.llmdevsilo/harness/a1b2c3d4e5f6/local-token",
   "pid": 4242,
-  "workspace": "/Users/me/project"
+  "workspace": "/Users/me/project",
+  "sandbox_kind": "macos-sandbox-exec",
+  "read_allowlist": ["/usr/bin"],
+  "allowed_domains": ["crates.io"]
 }
 ```
 
@@ -968,6 +971,22 @@ A local client connects to `wss://<addr>`, pins
 `cert_fingerprint_sha256`, reads the token from `local_token_path`, and
 authenticates with the `local_token` method. Remote clients receive the
 address, fingerprint, and a pairing code out of band instead.
+
+The last three fields describe the harness's sandbox access policy:
+the sandbox backend name (`sandbox_kind`), the read allowlist as
+configured for the harness (`read_allowlist`), and the domains the
+egress proxy allows (`allowed_domains`). `read_allowlist` holds the
+configured entries, exactly as the harness was started with; the
+expanded per-platform list of readable paths (operating-system
+baseline directories and the like) appears only in the access report.
+`silo shell` reads these fields to mirror the policy when it opens a
+shell into the same workspace, and treats the mirrored allowlist
+entries as already accepted by the running harness's risk scan
+(printing the entries accepted by inheritance). They never contain
+credential material — credential injection settings are not written to
+run files. The fields are additive and optional: run files written
+before they existed parse with empty defaults, and older readers
+ignore them.
 
 ### 5.3 The local token
 

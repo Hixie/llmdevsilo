@@ -376,6 +376,9 @@ mod tests {
             local_token_path: "/tmp/token".into(),
             pid: 1,
             workspace: "/tmp/ws".into(),
+            sandbox_kind: None,
+            read_allowlist: Vec::new(),
+            allowed_domains: Vec::new(),
         };
         std::fs::write(runs.join("abc.json"), serde_json::to_string(&info).unwrap()).unwrap();
         std::fs::write(runs.join("broken.json"), "{nope").unwrap();

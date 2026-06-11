@@ -84,3 +84,26 @@ pub async fn create_sandbox(
         ))),
     }
 }
+
+/// Sends SIGTERM to a process group, waits up to two seconds for it to
+/// disappear, then sends SIGKILL. Backends spawn user shells as group
+/// leaders so the whole session is killable as a unit.
+#[cfg(unix)]
+pub(crate) async fn terminate_process_group(pgid: i32) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    use std::time::{Duration, Instant};
+
+    let group = Pid::from_raw(pgid);
+    if killpg(group, Signal::SIGTERM).is_err() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if killpg(group, None).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = killpg(group, Signal::SIGKILL);
+}

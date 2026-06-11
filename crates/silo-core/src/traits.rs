@@ -66,6 +66,16 @@ pub trait Sandbox: Send + Sync {
         ))
     }
 
+    /// Terminates a running `user_shell` session: the shell's process
+    /// group receives SIGTERM, then SIGKILL when it does not exit
+    /// promptly, and the blocked `user_shell` call returns. Callers (for
+    /// example the `silo shell` signal handler) use this to stop the
+    /// session and unwind through their cleanup path. The default does
+    /// nothing.
+    async fn terminate_user_shell(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// Terminates the helper, tears down the sandbox, and removes the
     /// scratch space.
     async fn shutdown(&mut self) -> Result<(), SandboxError>;
@@ -119,6 +129,10 @@ pub struct FrontendContext {
     pub state_dir: PathBuf,
     /// Workspace path string, for display.
     pub workspace: String,
+    /// The sandbox read allowlist as configured for this harness, for the
+    /// run file. The access report's `readable_paths` holds the expanded
+    /// per-platform view instead.
+    pub configured_read_allowlist: Vec<String>,
 }
 
 /// One harness has exactly one frontend. The harness calls

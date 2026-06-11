@@ -146,7 +146,11 @@ pub enum ServerMessage {
 }
 
 /// Connection details written to the run file for local clients and shown
-/// to the user for remote ones.
+/// to the user for remote ones. The sandbox-policy fields (`sandbox_kind`,
+/// `read_allowlist`, `allowed_domains`) describe the running harness's
+/// access policy so `silo shell` can mirror it; they hold no credential
+/// material. Run files written before these fields existed parse with the
+/// defaults.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunInfo {
     pub harness_id: String,
@@ -159,6 +163,16 @@ pub struct RunInfo {
     pub local_token_path: String,
     pub pid: u32,
     pub workspace: String,
+    /// Sandbox backend in use, e.g. "macos-sandbox-exec". Absent in run
+    /// files written by older harnesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_kind: Option<String>,
+    /// Host paths the sandbox can read but not write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_allowlist: Vec<String>,
+    /// Domains the egress proxy allows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
 }
 
 #[cfg(test)]
@@ -184,5 +198,41 @@ mod tests {
         assert_eq!(value, serde_json::json!({"type": "interrupt"}));
         let parsed: ClientMessage = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, message);
+    }
+
+    #[test]
+    fn run_info_without_policy_fields_parses_with_defaults() {
+        let old = serde_json::json!({
+            "harness_id": "a1b2c3",
+            "addr": "127.0.0.1:7777",
+            "cert_fingerprint_sha256": "00".repeat(32),
+            "local_token_path": "/state/harness/a1b2c3/local-token",
+            "pid": 4242,
+            "workspace": "/home/me/project",
+        });
+        let info: RunInfo = serde_json::from_value(old).unwrap();
+        assert_eq!(info.harness_id, "a1b2c3");
+        assert!(info.sandbox_kind.is_none());
+        assert!(info.read_allowlist.is_empty());
+        assert!(info.allowed_domains.is_empty());
+    }
+
+    #[test]
+    fn run_info_policy_fields_roundtrip() {
+        let info = RunInfo {
+            harness_id: "a1b2c3".into(),
+            addr: "127.0.0.1:7777".into(),
+            cert_fingerprint_sha256: "00".repeat(32),
+            local_token_path: "/state/harness/a1b2c3/local-token".into(),
+            pid: 4242,
+            workspace: "/home/me/project".into(),
+            sandbox_kind: Some("macos-sandbox-exec".into()),
+            read_allowlist: vec!["/usr/bin".into()],
+            allowed_domains: vec!["crates.io".into()],
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["sandbox_kind"], "macos-sandbox-exec");
+        let parsed: RunInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, info);
     }
 }

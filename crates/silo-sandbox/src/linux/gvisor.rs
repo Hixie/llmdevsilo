@@ -64,6 +64,9 @@ struct Running {
     _forwarder: UnixToTcpForwarder,
     session: HelperSession,
     child: Child,
+    /// Process group of a live user shell; `terminate_user_shell` signals
+    /// it.
+    shell_pgid: std::sync::Mutex<Option<i32>>,
 }
 
 struct GvisorBackend {
@@ -287,6 +290,7 @@ impl Sandbox for GvisorBackend {
             _forwarder: forwarder,
             session,
             child,
+            shell_pgid: std::sync::Mutex::new(None),
         });
         Ok(())
     }
@@ -375,18 +379,28 @@ impl Sandbox for GvisorBackend {
             }
             None => vec!["/bin/sh".to_string(), "-i".to_string()],
         };
-        let status = Command::new(&running.runsc)
-            .arg("exec")
+        let mut cmd = Command::new(&running.runsc);
+        cmd.arg("exec")
             .arg("--cwd")
             .arg(spec::WORKSPACE_DEST)
             .arg(&running.container_id)
             .args(&argv)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .await
+            .stderr(Stdio::inherit());
+        // The shell client runs as the leader of its own process group,
+        // so the whole session can be terminated as a unit.
+        cmd.process_group(0);
+        let mut child = cmd
+            .spawn()
             .map_err(|e| SandboxError::Setup(format!("cannot spawn runsc exec: {e}")))?;
+        if let Some(pid) = child.id() {
+            *running.shell_pgid.lock().expect("shell pgid poisoned") = Some(pid as i32);
+        }
+        let status = child.wait().await;
+        *running.shell_pgid.lock().expect("shell pgid poisoned") = None;
+        let status =
+            status.map_err(|e| SandboxError::Setup(format!("cannot wait for runsc exec: {e}")))?;
         if let Some(code) = status.code() {
             return Ok(code);
         }
@@ -397,6 +411,17 @@ impl Sandbox for GvisorBackend {
             }
         }
         Ok(-1)
+    }
+
+    async fn terminate_user_shell(&self) -> Result<(), SandboxError> {
+        let Some(running) = &self.running else {
+            return Ok(());
+        };
+        let pgid = *running.shell_pgid.lock().expect("shell pgid poisoned");
+        if let Some(pgid) = pgid {
+            crate::terminate_process_group(pgid).await;
+        }
+        Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<(), SandboxError> {

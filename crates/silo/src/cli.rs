@@ -34,6 +34,13 @@ pub enum Command {
         action: WorkspaceAction,
     },
     /// Open an interactive shell under the same sandbox policy as the LLM.
+    ///
+    /// The workspace may already be attached to a running harness; the
+    /// shell then shares the workspace mount, so the harness's work is
+    /// visible live. When no sandbox flags are given and a harness is
+    /// running, the shell mirrors that harness's sandbox kind, read
+    /// allowlist, and allowed domains. Credential injection is never
+    /// mirrored; only credentials given with --inject-credential apply.
     Shell(ShellArgs),
     /// Convert a journal into a replayable test script.
     ReplayTest(ReplayTestArgs),
@@ -165,14 +172,21 @@ pub struct ShellArgs {
     /// Locked workspace directory.
     #[arg(long)]
     pub workspace: PathBuf,
-    /// Host path the sandbox may read (repeatable).
+    /// Host path the sandbox may read (repeatable). Overrides mirroring.
     #[arg(long = "allow-read")]
     pub allow_read: Vec<PathBuf>,
-    /// Domain the sandbox may reach (repeatable).
+    /// Domain the sandbox may reach (repeatable). Overrides mirroring.
     #[arg(long = "allow-domain")]
     pub allow_domain: Vec<String>,
-    #[arg(long, value_enum, default_value = "auto")]
-    pub sandbox: SandboxOpt,
+    /// Sandbox backend. Defaults to the running harness's backend when
+    /// mirroring, otherwise to auto. Overrides mirroring.
+    #[arg(long, value_enum)]
+    pub sandbox: Option<SandboxOpt>,
+    /// Credential injection: host:header:ENV_VAR[:format] (repeatable).
+    /// Credentials are never mirrored from a running harness; only the
+    /// ones given here are injected.
+    #[arg(long = "inject-credential")]
+    pub inject_credential: Vec<String>,
     /// Accept this read-allowlist entry despite risk-scan hits
     /// (repeatable).
     #[arg(long = "allow-risky-path")]
@@ -210,6 +224,20 @@ pub fn resolve_sandbox_kind(opt: SandboxOpt) -> SandboxKind {
         SandboxOpt::LinuxVm => SandboxKind::MacosLinuxVm,
         SandboxOpt::Gvisor => SandboxKind::LinuxGvisor,
         SandboxOpt::Microvm => SandboxKind::LinuxMicrovm,
+    }
+}
+
+/// Maps a sandbox kind name, as reported in a run file (the
+/// `Sandbox::kind` string), back to the configuration enum. Unknown names
+/// yield `None`.
+pub fn sandbox_kind_from_name(name: &str) -> Option<SandboxKind> {
+    match name {
+        "mock" => Some(SandboxKind::Mock),
+        "macos-sandbox-exec" => Some(SandboxKind::MacosSandboxExec),
+        "macos-linux-vm" => Some(SandboxKind::MacosLinuxVm),
+        "linux-gvisor" => Some(SandboxKind::LinuxGvisor),
+        "linux-microvm" => Some(SandboxKind::LinuxMicrovm),
+        _ => None,
     }
 }
 
@@ -412,6 +440,20 @@ mod tests {
         let args = parse_run(&["--llm", "anthropic", "--sandbox", "auto"]);
         let config = build_run_config(&args).unwrap();
         assert_eq!(config.sandbox.kind, expected);
+    }
+
+    #[test]
+    fn sandbox_kind_names_map_back_to_kinds() {
+        assert_eq!(sandbox_kind_from_name("mock"), Some(SandboxKind::Mock));
+        assert_eq!(
+            sandbox_kind_from_name("macos-sandbox-exec"),
+            Some(SandboxKind::MacosSandboxExec)
+        );
+        assert_eq!(
+            sandbox_kind_from_name("linux-gvisor"),
+            Some(SandboxKind::LinuxGvisor)
+        );
+        assert_eq!(sandbox_kind_from_name("unheard-of"), None);
     }
 
     #[test]

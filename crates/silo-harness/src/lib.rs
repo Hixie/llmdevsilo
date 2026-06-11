@@ -222,6 +222,12 @@ pub async fn run(
         access: access.clone(),
         state_dir: state_dir.clone(),
         workspace: config.workspace.display().to_string(),
+        configured_read_allowlist: config
+            .sandbox
+            .read_allowlist
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
     };
     if let Err(error) = frontend.start(frontend_context).await {
         let error: HarnessError = error.into();

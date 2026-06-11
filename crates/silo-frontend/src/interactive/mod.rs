@@ -147,6 +147,13 @@ impl Frontend for InteractiveFrontend {
             local_token_path: token_path.to_string_lossy().into_owned(),
             pid: std::process::id(),
             workspace: ctx.workspace.clone(),
+            // Sandbox policy for `silo shell` to mirror: the configured
+            // read allowlist (the access report carries the expanded
+            // per-platform view instead). No credential material: only
+            // domain names appear and credential domains are not copied.
+            sandbox_kind: Some(ctx.access.sandbox_kind.clone()),
+            read_allowlist: ctx.configured_read_allowlist.clone(),
+            allowed_domains: ctx.access.allowed_domains.clone(),
         };
         let run_json = serde_json::to_string_pretty(&run_info)
             .map_err(|e| FrontendError::Setup(format!("unserializable run info: {e}")))?;
