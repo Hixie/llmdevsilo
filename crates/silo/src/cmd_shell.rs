@@ -37,6 +37,7 @@ struct ShellPolicy {
 }
 
 pub async fn execute(args: ShellArgs) -> anyhow::Result<u8> {
+    crate::cli::validate_shell_args(&args)?;
     let state_dir = silo_core::paths::state_dir();
     std::fs::create_dir_all(&state_dir)?;
 
@@ -63,12 +64,15 @@ pub async fn execute(args: ShellArgs) -> anyhow::Result<u8> {
         }
         accepted_risky.extend(policy.read_allowlist.iter().cloned());
     }
-    silo_harness::validate_read_allowlist(
+    let allowlist_warnings = silo_harness::validate_read_allowlist(
         &policy.read_allowlist,
         &home,
         &state_dir,
         &accepted_risky,
     )?;
+    for warning in &allowlist_warnings {
+        eprintln!("warning: {warning}");
+    }
 
     let session_id = format!("shell-{}", silo_core::short_id());
     let attached = manager

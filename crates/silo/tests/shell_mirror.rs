@@ -142,7 +142,19 @@ fn mirrored_risky_entries_are_accepted_by_inheritance() {
 #[test]
 fn explicit_sandbox_flags_win_over_mirroring_with_a_note() {
     let fixture = fixture("mock", Vec::new());
-    let output = run_shell(&fixture, &["--sandbox", "mock"], &["/bin/sh", "-c", "true"]);
+    // A scaffold backend exercises the explicit-flags decision without a
+    // platform sandbox; sandbox creation then fails (the backend reports
+    // itself unavailable), which is irrelevant to the note under test.
+    let scaffold = if cfg!(target_os = "macos") {
+        "linux-vm"
+    } else {
+        "microvm"
+    };
+    let output = run_shell(
+        &fixture,
+        &["--sandbox", scaffold],
+        &["/bin/sh", "-c", "true"],
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(&format!(

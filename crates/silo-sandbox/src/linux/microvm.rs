@@ -1,6 +1,6 @@
 //! Scaffold of the Linux microVM backend (Firecracker-style).
 //!
-//! Design (see `docs/sandbox-backends.md`, section "linux-microvm"): a
+//! Design (see `docs/SANDBOX-BACKENDS.md`, section "linux-microvm"): a
 //! minimal guest kernel boots with the workspace and the read allowlist
 //! attached over virtio-fs (or, for the workspace container file, a
 //! virtio-blk device); the scratch space is a guest-local filesystem; the
@@ -24,7 +24,7 @@ pub async fn create(
     _journal: JournalHandle,
 ) -> Result<Box<dyn Sandbox>, SandboxError> {
     Err(SandboxError::Unavailable(
-        "the microVM backend is not implemented yet; see docs/sandbox-backends.md \
+        "the microVM backend is not implemented yet; see docs/SANDBOX-BACKENDS.md \
          (linux-microvm) for the design, or use the linux-gvisor backend"
             .into(),
     ))
@@ -46,7 +46,7 @@ mod tests {
         let journal = JournalHandle::disabled(Arc::new(FakeClock::default()));
         match create(&SandboxConfig::default(), proxy, journal).await {
             Err(SandboxError::Unavailable(message)) => {
-                assert!(message.contains("docs/sandbox-backends.md"));
+                assert!(message.contains("docs/SANDBOX-BACKENDS.md"));
             }
             Err(other) => panic!("expected Unavailable, got {other:?}"),
             Ok(_) => panic!("expected Unavailable, got a sandbox"),

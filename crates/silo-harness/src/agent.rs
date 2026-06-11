@@ -531,6 +531,24 @@ async fn run_agent_tool(
     }
 }
 
+/// How the top-level session ended.
+pub(crate) struct SessionEnd {
+    /// Final message (from the shutdown request or the last failure).
+    pub message: Option<String>,
+    /// The last failure message when the session ended through the
+    /// consecutive-LLM-failure path.
+    pub llm_failure: Option<String>,
+}
+
+impl SessionEnd {
+    fn normal(message: Option<String>) -> SessionEnd {
+        SessionEnd {
+            message,
+            llm_failure: None,
+        }
+    }
+}
+
 /// Appends a user prompt to the conversation. When the conversation
 /// already ends with a user message — tool results from an interrupted
 /// turn, or an earlier prompt whose turn was interrupted before any
@@ -548,9 +566,9 @@ fn push_user_prompt(messages: &mut Vec<Message>, text: String) {
 }
 
 /// The top-level loop: emits AwaitingInput, waits for the next user input
-/// (or a shutdown request), runs the turn, and repeats. Returns the final
-/// shutdown message.
-pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<Option<String>, HarnessError> {
+/// (or a shutdown request), runs the turn, and repeats. Returns how the
+/// session ended, with the final shutdown message.
+pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<SessionEnd, HarnessError> {
     let agent = silo_core::conversation::top_level_agent_id();
     let mut messages: Vec<Message> = Vec::new();
     // The headless frontend answers every input request immediately, so a
@@ -562,12 +580,12 @@ pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<Option<String
     let mut consecutive_llm_failures: u32 = 0;
     loop {
         if let Some(message) = ctx.shutdown.check().await {
-            return Ok(message);
+            return Ok(SessionEnd::normal(message));
         }
         ctx.bus.emit(EventPayload::AwaitingInput);
         let input = tokio::select! {
             biased;
-            message = ctx.shutdown.wait() => return Ok(message),
+            message = ctx.shutdown.wait() => return Ok(SessionEnd::normal(message)),
             input = ctx.frontend.next_user_input() => input,
         };
         match input {
@@ -577,7 +595,7 @@ pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<Option<String
                 // interrupt is consumed here and does not abort the new
                 // turn.
                 if let Some(message) = ctx.shutdown.check().await {
-                    return Ok(message);
+                    return Ok(SessionEnd::normal(message));
                 }
                 let turn_generation = ctx.shutdown.interrupt_generation();
                 // The interactive frontend emits UserPrompt itself when a
@@ -633,12 +651,17 @@ pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<Option<String
                                      consecutive LLM failure(s): {message}"
                                 ),
                             });
-                            return Ok(Some(message));
+                            return Ok(SessionEnd {
+                                message: Some(message.clone()),
+                                llm_failure: Some(message),
+                            });
                         }
                         continue;
                     }
                     TurnOutcome::ShutdownRequested => {
-                        return Ok(ctx.shutdown.check().await.unwrap_or(None));
+                        return Ok(SessionEnd::normal(
+                            ctx.shutdown.check().await.unwrap_or(None),
+                        ));
                     }
                 }
             }
@@ -648,7 +671,9 @@ pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<Option<String
                 ctx.journal.append(JournalEntry::Lifecycle {
                     message: format!("frontend script exhausted: {detail}"),
                 });
-                return Ok(Some("frontend script exhausted".to_string()));
+                return Ok(SessionEnd::normal(Some(
+                    "frontend script exhausted".to_string(),
+                )));
             }
             Err(error) => {
                 ctx.bus.emit(EventPayload::Error {

@@ -11,10 +11,13 @@ const String siloNotFoundMessage =
 
 /// The first existing `silo` binary among, in order: [configuredPath], the
 /// `SILO_BIN` environment variable, each entry of `PATH` joined with
-/// `silo`, `target/release/silo` and `target/debug/silo` under each
-/// ancestor directory of [executablePath] (so an app running out of the
-/// llmdevsilo repository finds the workspace build), then
-/// `$HOME/.cargo/bin/silo`, `/opt/homebrew/bin/silo`, and
+/// `silo`, the `Helpers/silo` sibling of the directory containing
+/// [executablePath] (the release app bundle embeds the CLI binaries at
+/// `Silo.app/Contents/Helpers/`), `target/release/silo` and
+/// `target/debug/silo` under each ancestor directory of [executablePath]
+/// (so an app running out of the llmdevsilo repository finds the
+/// workspace build), then `$HOME/.cargo/bin/silo`,
+/// `/opt/homebrew/bin/silo`, and
 /// `/usr/local/bin/silo`. Candidates that are empty or for which
 /// [fileExists] returns false are skipped. Returns null when no candidate
 /// exists. Paths use POSIX conventions (`:`-separated `PATH`, `/` joins);
@@ -45,12 +48,17 @@ List<String> siloCandidates({
   String? executablePath,
 }) {
   final home = environment['HOME'] ?? '';
+  final ancestors = _ancestors(executablePath);
   return [
     ?configuredPath,
     environment['SILO_BIN'] ?? '',
     for (final dir in (environment['PATH'] ?? '').split(':'))
       if (dir.isNotEmpty) '$dir/silo',
-    for (final ancestor in _ancestors(executablePath)) ...[
+    // The app bundle's embedded CLI binaries: the executable lives at
+    // <bundle>/Contents/MacOS/<app>, so the second ancestor is
+    // <bundle>/Contents and the binaries are in its Helpers directory.
+    if (ancestors.length >= 2) '${ancestors[1]}/Helpers/silo',
+    for (final ancestor in ancestors) ...[
       '$ancestor/target/release/silo',
       '$ancestor/target/debug/silo',
     ],

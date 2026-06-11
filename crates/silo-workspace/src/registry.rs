@@ -274,6 +274,28 @@ mod tests {
     }
 
     #[test]
+    fn registry_with_an_ext4_fuse_entry_parses() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("workspaces");
+        fs::create_dir_all(&dir).unwrap();
+        let json = serde_json::json!({
+            "/some/path": {
+                "id": "abc123def456",
+                "locked": true,
+                "strategy": "ext4_fuse"
+            }
+        });
+        fs::write(
+            dir.join("registry.json"),
+            serde_json::to_string_pretty(&json).unwrap(),
+        )
+        .unwrap();
+        let registry = load(&dir).unwrap();
+        let entry = registry.get("/some/path").unwrap();
+        assert_eq!(entry.strategy, ContainerStrategy::Ext4Fuse);
+    }
+
+    #[test]
     fn missing_registry_loads_empty() {
         let temp = tempfile::tempdir().unwrap();
         assert!(load(&temp.path().join("workspaces")).unwrap().is_empty());

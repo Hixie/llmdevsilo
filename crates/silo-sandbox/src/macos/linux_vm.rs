@@ -1,6 +1,6 @@
 //! Scaffold of the macOS Linux-VM backend (Virtualization.framework).
 //!
-//! Design (see `docs/sandbox-backends.md`, section "macos-linux-vm"):
+//! Design (see `docs/SANDBOX-BACKENDS.md`, section "macos-linux-vm"):
 //! a minimal Linux guest is booted through Virtualization.framework; the
 //! workspace and the read allowlist are attached with virtio-fs (the
 //! workspace read/write, allowlist shares read-only); the scratch space is
@@ -26,7 +26,7 @@ pub async fn create(
 ) -> Result<Box<dyn Sandbox>, SandboxError> {
     Err(SandboxError::Unavailable(
         "the Virtualization.framework Linux VM backend is not implemented yet; \
-         see docs/sandbox-backends.md (macos-linux-vm) for the design, or use \
+         see docs/SANDBOX-BACKENDS.md (macos-linux-vm) for the design, or use \
          the macos-sandbox-exec backend"
             .into(),
     ))
@@ -48,7 +48,7 @@ mod tests {
         let journal = JournalHandle::disabled(Arc::new(FakeClock::default()));
         match create(&SandboxConfig::default(), proxy, journal).await {
             Err(SandboxError::Unavailable(message)) => {
-                assert!(message.contains("docs/sandbox-backends.md"));
+                assert!(message.contains("docs/SANDBOX-BACKENDS.md"));
             }
             Err(other) => panic!("expected Unavailable, got {other:?}"),
             Ok(_) => panic!("expected Unavailable, got a sandbox"),

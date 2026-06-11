@@ -8,16 +8,35 @@ use silo_core::risk;
 /// Scans `entries` against the hardcoded risk list and refuses entries that
 /// would expose known-sensitive paths under `home` or the harness state
 /// directory. An entry listed in `allow_risky` is accepted despite its
-/// hits.
+/// hits; entries and overrides are compared by normalized location
+/// (symlinks resolved, trailing slashes ignored), not by spelling. Returns
+/// one warning per `allow_risky` entry that matches no allowlist entry.
 pub fn validate_read_allowlist(
     entries: &[PathBuf],
     home: &Path,
     state_dir: &Path,
     allow_risky: &[PathBuf],
-) -> Result<(), HarnessError> {
+) -> Result<Vec<String>, HarnessError> {
+    let normalized_entries: Vec<PathBuf> = entries
+        .iter()
+        .map(|entry| risk::normalize_path(entry))
+        .collect();
+    let overrides: Vec<PathBuf> = allow_risky
+        .iter()
+        .map(|path| risk::normalize_path(path))
+        .collect();
+    let mut warnings = Vec::new();
+    for (original, normalized) in allow_risky.iter().zip(&overrides) {
+        if !normalized_entries.contains(normalized) {
+            warnings.push(format!(
+                "--allow-risky-path {} matches no read-allowlist entry; it has no effect",
+                original.display()
+            ));
+        }
+    }
     let mut lines = Vec::new();
     for (entry, hit) in risk::scan_allowlist(entries, home, state_dir) {
-        if allow_risky.iter().any(|allowed| allowed == &entry) {
+        if overrides.contains(&risk::normalize_path(&entry)) {
             continue;
         }
         lines.push(format!(
@@ -28,27 +47,13 @@ pub fn validate_read_allowlist(
         ));
     }
     if lines.is_empty() {
-        Ok(())
+        Ok(warnings)
     } else {
         Err(HarnessError::Config(format!(
             "refusing risky read allowlist entries: {}",
             lines.join("; ")
         )))
     }
-}
-
-/// Canonicalizes the nearest existing ancestor and reattaches the
-/// remainder, so nonexistent paths compare by their real location.
-fn normalize(path: &Path) -> PathBuf {
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return real;
-    }
-    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-        if !parent.as_os_str().is_empty() {
-            return normalize(parent).join(name);
-        }
-    }
-    path.to_path_buf()
 }
 
 /// Refuses a journal location the sandbox could read: an allowlist entry
@@ -59,11 +64,11 @@ pub fn validate_journal_path(
     read_allowlist: &[PathBuf],
 ) -> Result<(), HarnessError> {
     let journal_dir = match journal_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => normalize(parent),
-        _ => normalize(journal_path),
+        Some(parent) if !parent.as_os_str().is_empty() => risk::normalize_path(parent),
+        _ => risk::normalize_path(journal_path),
     };
     for entry in read_allowlist {
-        let entry = normalize(entry);
+        let entry = risk::normalize_path(entry);
         if entry.starts_with(&journal_dir) || journal_dir.starts_with(&entry) {
             return Err(HarnessError::Config(format!(
                 "the journal at {} would be readable from the sandbox via the \
@@ -151,5 +156,63 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
 
         assert!(validate_read_allowlist(&[bin], home, &state, &[]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_override_matches_the_entry_by_location() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let state = home.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let link = home.join("ssh-alias");
+        std::os::unix::fs::symlink(&ssh, &link).unwrap();
+
+        let warnings =
+            validate_read_allowlist(std::slice::from_ref(&ssh), home, &state, &[link]).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn trailing_slash_override_matches_the_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let state = home.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+
+        let with_slash = PathBuf::from(format!("{}/", ssh.display()));
+        let warnings =
+            validate_read_allowlist(std::slice::from_ref(&ssh), home, &state, &[with_slash])
+                .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn unmatched_override_warns_that_it_has_no_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let state = home.join("state");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let unrelated = temp.path().join("unrelated");
+
+        let warnings = validate_read_allowlist(
+            std::slice::from_ref(&bin),
+            home,
+            &state,
+            std::slice::from_ref(&unrelated),
+        )
+        .unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("no effect"), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains(&unrelated.display().to_string()),
+            "{}",
+            warnings[0]
+        );
     }
 }

@@ -7,6 +7,7 @@ use clap::Parser;
 
 mod cli;
 mod cmd_harnesses;
+mod cmd_manpages;
 mod cmd_replay;
 mod cmd_run;
 mod cmd_shell;
@@ -31,6 +32,7 @@ async fn main() -> ExitCode {
         cli::Command::Harnesses {
             action: cli::HarnessesAction::List,
         } => cmd_harnesses::list(),
+        cli::Command::Manpages { output_dir } => cmd_manpages::execute(&output_dir),
     };
     match result {
         Ok(code) => ExitCode::from(code),

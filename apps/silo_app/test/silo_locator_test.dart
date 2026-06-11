@@ -166,6 +166,57 @@ void main() {
       );
     });
 
+    test('the app bundle Helpers directory is probed', () {
+      // A release bundle embeds the CLI binaries at Contents/Helpers/.
+      const exe = '/Applications/Silo.app/Contents/MacOS/Silo';
+      expect(
+        locate(
+          executablePath: exe,
+          existing: {'/Applications/Silo.app/Contents/Helpers/silo'},
+        ),
+        '/Applications/Silo.app/Contents/Helpers/silo',
+      );
+    });
+
+    test('PATH wins over the bundle Helpers candidate', () {
+      expect(
+        locate(
+          executablePath: '/Applications/Silo.app/Contents/MacOS/Silo',
+          environment: {'PATH': '/bin'},
+          existing: {
+            '/bin/silo',
+            '/Applications/Silo.app/Contents/Helpers/silo',
+          },
+        ),
+        '/bin/silo',
+      );
+    });
+
+    test('the bundle Helpers candidate wins over workspace builds', () {
+      const exe = '/repo/apps/silo_app/build/macos/Build/Products/Release/'
+          'Silo.app/Contents/MacOS/Silo';
+      expect(
+        locate(
+          executablePath: exe,
+          existing: {
+            '/repo/apps/silo_app/build/macos/Build/Products/Release/'
+                'Silo.app/Contents/Helpers/silo',
+            '/repo/target/release/silo',
+          },
+        ),
+        '/repo/apps/silo_app/build/macos/Build/Products/Release/'
+        'Silo.app/Contents/Helpers/silo',
+      );
+    });
+
+    test('a path with fewer than two ancestors adds no Helpers candidate',
+        () {
+      expect(
+        siloCandidates(environment: const {}, executablePath: '/Silo'),
+        ['/opt/homebrew/bin/silo', '/usr/local/bin/silo'],
+      );
+    });
+
     test('PATH and SILO_BIN take precedence over workspace builds', () {
       expect(
         locate(

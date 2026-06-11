@@ -50,6 +50,11 @@ async fn headless_session_ends_on_the_first_quota_failure() {
 
     let message = outcome.message.expect("outcome message");
     assert!(message.contains("quota"), "message: {message}");
+    let failure = outcome
+        .llm_failure
+        .as_deref()
+        .expect("the outcome records the LLM failure");
+    assert!(failure.contains("quota"), "failure: {failure}");
     assert!(
         script.finished(),
         "remaining: {}",

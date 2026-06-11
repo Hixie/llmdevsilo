@@ -13,7 +13,7 @@ duplicated here:
   WebSocket protocol and its authentication, the helper protocol, the
   proxy behavior, and what gets journaled.
 - [SECURITY.md](SECURITY.md) — the security model and its boundaries.
-- [sandbox-backends.md](sandbox-backends.md) — each sandbox backend's
+- [SANDBOX-BACKENDS.md](SANDBOX-BACKENDS.md) — each sandbox backend's
   enforcement mechanism, invariants, and tradeoffs.
 - [apps/silo_app/README.md](../apps/silo_app/README.md) — the Flutter
   client, including how it stores secrets and the macOS keychain and
@@ -64,9 +64,10 @@ output (reports, connection details, final messages).
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Success. For `silo run` this includes every session that ends through the normal shutdown path — a client shutdown request, the headless Exit tool, or a session ended by repeated LLM failures (for example an exhausted quota). The final message, when there is one, is printed to standard output. |
+| 0 | Success. For `silo run` this means a session that ends through the normal shutdown path — a client shutdown request or the headless Exit tool. The final message, when there is one, is printed to standard output. |
 | 1 | A runtime error. The message is printed to standard error, prefixed `silo:`. |
 | 2 | A command-line usage error (unknown flag, missing argument, bad value). |
+| 3 | `silo run` only: the session was ended by repeated LLM failures (for example an exhausted quota) — the first failure for the headless frontend, the eighth consecutive failed turn for the others. The failure message is printed to standard error, not standard output. |
 | other | `silo shell` exits with the sandboxed shell's or command's own exit code (clamped to the 0–255 range). |
 
 ### The no-remote-secrets configuration model
@@ -107,12 +108,21 @@ The session ends when the frontend requests shutdown (a connected client
 asks for it, or the headless agent calls the Exit tool), when a signal
 arrives, or — for the headless frontend — on the first LLM failure. At
 the end, the final message (if any) is printed to standard output and the
-journal path is printed to standard error as `journal: <path>`.
+journal path is printed to standard error as `journal: <path>`. A session
+ended by repeated LLM failures instead prints the failure message to
+standard error and exits with code 3 (see the exit-code table above).
 
-A note on defaults: with no `--config` file, the built-in defaults select
-the *mock* LLM backend and the *mock* sandbox, which exist for testing
-and require `--script`. A real session therefore always passes at least
-`--llm` and `--sandbox`.
+The defaults select a real session: the LLM backend is chosen from the
+environment (see the LLM backend flags below) and the sandbox defaults to
+`auto`, the platform's native backend. The mock components exist for
+testing, require `--script`, and are only used when selected explicitly.
+
+Before the session starts, `silo run` prints a warning to standard error
+for each setting that cannot have its intended effect: an
+`--inject-credential` host that no allowed domain covers (the credential
+could never apply), a paid LLM backend with no `--quota-tokens` or
+`--quota-usd` limit, and an `--allow-risky-path` entry that matches no
+read-allowlist entry.
 
 ### Workspace flags
 
@@ -196,7 +206,16 @@ and require `--script`. A real session therefore always passes at least
 ### LLM backend flags
 
 - `--llm <LLM>` — `anthropic`, `openai`, `openai-ws`, `local`, or
-  `mock`. Default: `mock` (which requires `--script`).
+  `mock`. Without this flag (and without a backend in the `--config`
+  file), the backend is chosen from the environment: if
+  `OPENAI_API_KEY` is set and non-empty, `openai` with default model
+  `gpt-5`; otherwise, if `ANTHROPIC_API_KEY` is set and non-empty,
+  `anthropic` with default model `claude-sonnet-4-6`. The auto-selection
+  is announced with one line on standard error. If neither variable is
+  set, the command fails with an error naming the three options (pass
+  `--llm`, or set one of the two variables). An explicit `--llm` always
+  wins; a backend set in the `--config` file beats the environment; and
+  `--model` and `--api-key-env` override the auto-selected defaults.
 
   - `anthropic` — the Anthropic Messages REST API.
   - `openai` — the OpenAI Responses REST API.
@@ -213,7 +232,9 @@ and require `--script`. A real session therefore always passes at least
   - `mock` — scripted responses from `--script`, for tests.
 
 - `--model <MODEL>` — the model identifier passed to the backend.
-  Default: `claude-sonnet-4-6`.
+  Default: the environment auto-selection's model when it applies
+  (`gpt-5` or `claude-sonnet-4-6`, as above); `claude-sonnet-4-6`
+  otherwise.
 - `--api-key-env <API_KEY_ENV>` — the name of the environment variable
   holding the LLM API key. Defaults: `ANTHROPIC_API_KEY` for the
   Anthropic backend, `OPENAI_API_KEY` for both OpenAI backends. The
@@ -231,18 +252,22 @@ and require `--script`. A real session therefore always passes at least
 - `--quota-usd <QUOTA_USD>` — maximum dollar spend for the session,
   computed from configured pricing. Default: unlimited.
 
+Running a paid backend (`anthropic`, `openai`, `openai-ws`) with neither
+quota flag prints a startup warning to standard error suggesting one.
+
 The quota is checked before each LLM request. Once exhausted, every
 further request fails with a quota-exceeded error. What happens next
 depends on the frontend:
 
 - **headless**: the session ends on the first LLM failure (the loop
   would otherwise spin forever, because the headless frontend answers
-  every input request immediately). The quota message becomes the final
-  message, and the exit code is 0.
+  every input request immediately). The quota message is printed to
+  standard error and the exit code is 3.
 - **interactive** (and mock): the failure is broadcast to clients as an
   error event and the harness returns to awaiting input, so a human can
-  decide what to do. After 8 consecutive failed turns the session ends
-  with the last failure message.
+  decide what to do. After 8 consecutive failed turns the session ends:
+  the last failure message is printed to standard error and the exit
+  code is 3.
 
 Connected clients see ongoing cost reports per backend; the headless
 frontend prints them at exit.
@@ -250,9 +275,10 @@ frontend prints them at exit.
 ### Sandbox flags
 
 - `--sandbox <SANDBOX>` — `auto`, `mock`, `sandbox-exec`, `linux-vm`,
-  `gvisor`, or `microvm`. Default: `mock` (which requires `--script`).
-  `auto` resolves per platform: `sandbox-exec` on macOS, `gvisor` on
-  Linux.
+  `gvisor`, or `microvm`. Default: `auto` (unless the `--config` file
+  sets a sandbox kind), which resolves per platform: `sandbox-exec` on
+  macOS, `gvisor` on Linux. The mock sandbox requires `--script` and is
+  only used when selected explicitly.
 
   Availability by platform (selecting a backend not compiled for the
   platform is an error):
@@ -267,12 +293,12 @@ frontend prints them at exit.
 
   The backends are not interchangeable; the per-backend enforcement
   mechanisms, invariants, and security tradeoffs are documented in
-  [sandbox-backends.md](sandbox-backends.md).
+  [SANDBOX-BACKENDS.md](SANDBOX-BACKENDS.md).
 
 - `--allow-read <ALLOW_READ>` — a host path the sandbox may read and
   execute (never write). Repeatable. Default: none, beyond the
   backend's fixed operating-system baseline (system libraries and
-  binaries; see [sandbox-backends.md](sandbox-backends.md)). Each entry
+  binaries; see [SANDBOX-BACKENDS.md](SANDBOX-BACKENDS.md)). Each entry
   is checked against a hardcoded risk list before the session starts:
   the harness refuses any entry that equals, contains, or is contained
   in a known-sensitive path that exists on the system. The list covers
@@ -287,12 +313,15 @@ frontend prints them at exit.
   know about every secret on your disk — so keep allowlist entries
   narrow (toolchains, not home directories).
 - `--allow-risky-path <ALLOW_RISKY_PATH>` — accept one read-allowlist
-  entry despite risk-scan hits. Repeatable. The value must match the
-  corresponding `--allow-read` value verbatim; it accepts that entry
-  only, and other flagged entries are still refused. This is a
-  deliberate override for the rare case where you have judged the
-  exposure acceptable; the scan exists because a single broad entry can
-  silently hand the model your credentials.
+  entry despite risk-scan hits. Repeatable. The value is matched against
+  the `--allow-read` entries by location, not by spelling: both sides
+  are canonicalized first, so a symlinked alias or a trailing slash
+  still matches. It accepts the matching entry only, and other flagged
+  entries are still refused; a value that matches no entry prints a
+  startup warning that it had no effect. This is a deliberate override
+  for the rare case where you have judged the exposure acceptable; the
+  scan exists because a single broad entry can silently hand the model
+  your credentials.
 - `--allow-domain <ALLOW_DOMAIN>` — a domain the sandbox may reach
   through the egress proxy. Repeatable. Default: none (no network
   egress at all). An entry is either an exact host name
@@ -311,7 +340,9 @@ frontend prints them at exit.
 
   - The host must match exactly; wildcards are not supported here, and
     the host must *also* be allowed with `--allow-domain` (or a matching
-    wildcard) for requests to reach it.
+    wildcard) for requests to reach it. A credential whose host no
+    allowed domain covers prints a startup warning naming the missing
+    `--allow-domain`.
   - The secret value is read once from the named environment variable
     when the proxy starts; a missing variable is a startup error.
   - The secret lives only in the harness process. It never enters the
@@ -451,8 +482,19 @@ What locking does, in order:
      while a harness or shell is attached. If `hdiutil` fails, the lock
      falls back to the plain directory strategy and says so in a
      warning.
-   - **Linux** (and `--deterministic` locks): a plain directory under
-     the state directory.
+   - **Linux** (default when both `fuse2fs` and `mkfs.ext4` are on
+     `PATH` at lock time): a raw ext4 disk image (`workspace.img`)
+     formatted with `mkfs.ext4` and mounted user-space with `fuse2fs`
+     (no root required), mounted only while a harness or shell is
+     attached. The image size is fixed at lock time — twice the content
+     size plus 256 MiB of headroom, at least 1 GiB — and does not grow.
+     If the image setup fails, the lock falls back to the plain
+     directory strategy and says so in a warning.
+   - **Plain directory** (Linux without the ext4 tools, other
+     platforms, and `--deterministic` locks): a plain directory under
+     the state directory. On Linux a warning suggests installing
+     `fuse2fs` and `mkfs.ext4` (the `fuse2fs` and `e2fsprogs` packages)
+     to get the image strategy.
 4. Leaves a marker file (`LOCKED_BY_LLMDEVSILO`) in the now-empty
    original directory explaining the lock and how to undo it, and makes
    the directory read-only.
@@ -466,6 +508,11 @@ Honest caveats, printed as warnings:
 - Sparse bundle strategy: *"the workspace image is mounted host-visible
   while a harness is attached"* — while a session runs, the mounted
   volume is reachable from the host; do not edit it from outside.
+- Ext4 image strategy: *"the workspace image is mounted host-visible
+  while a harness is attached; the image size is fixed at lock time and
+  does not grow"* — the same host-visibility caveat as the sparse
+  bundle, plus the fixed-size limitation: a workspace that outgrows the
+  image sees out-of-space errors until it is unlocked and re-locked.
 
 The protection against host-side interference is therefore procedural,
 not cryptographic: the lock's purpose is to guarantee a complete,
@@ -484,7 +531,7 @@ Unlocks a workspace and prints the change report. The exact sequence:
    (signal, wait, then verify), with pid-reuse protection so an
    unrelated process that recycled the pid is never killed. Survivors
    abort the unlock.
-3. Detaches the disk image (sparse bundle strategy).
+3. Detaches the disk image (image-based strategies).
 4. Restores the contents into the original directory, restores write
    permission, and removes the marker file.
 5. Computes the change report by diffing the restored tree against the
@@ -551,9 +598,10 @@ or whose pid was recycled, so the counts reflect live processes.
 ### Files read and written
 
 `<state>/workspaces/registry.json` (and its `.lock` sibling),
-`<state>/workspaces/<id>/` (manifest, blobs, `data/` or
-`workspace.sparsebundle` plus its `mnt/` mountpoint), and the workspace
-directory itself (contents, marker file, directory permissions).
+`<state>/workspaces/<id>/` (manifest, blobs, and `data/`,
+`workspace.sparsebundle`, or `workspace.img` plus its `mnt/`
+mountpoint), and the workspace directory itself (contents, marker file,
+directory permissions).
 
 ### Examples
 
@@ -642,10 +690,11 @@ Rules:
 - `--allow-domain <ALLOW_DOMAIN>` — domain the sandbox may reach
   (repeatable). Overrides mirroring. Same wildcard semantics as
   `silo run`.
-- `--sandbox <SANDBOX>` — sandbox backend (`auto`, `mock`,
-  `sandbox-exec`, `linux-vm`, `gvisor`, `microvm`). Defaults to the
-  running harness's backend when mirroring, otherwise to `auto`.
-  Overrides mirroring.
+- `--sandbox <SANDBOX>` — sandbox backend (`auto`, `sandbox-exec`,
+  `linux-vm`, `gvisor`, `microvm`). Defaults to the running harness's
+  backend when mirroring, otherwise to `auto`. Overrides mirroring.
+  `mock` is rejected with an error: the mock sandbox is script-driven
+  and only usable via `silo run --script`.
 - `--inject-credential <INJECT_CREDENTIAL>` — same format and semantics
   as `silo run`. Only credentials given here are injected.
 - `--allow-risky-path <ALLOW_RISKY_PATH>` — accept a read-allowlist
@@ -823,6 +872,24 @@ With no live harnesses it prints `no running harnesses`.
 ### Files read and written
 
 Reads `<state>/run/*.json`; deletes stale ones.
+
+---
+
+## silo manpages
+
+### Synopsis
+
+```
+silo manpages <OUTPUT_DIR>
+```
+
+### Description
+
+Writes man pages generated from the live command definitions into
+`<OUTPUT_DIR>` (created if needed): `silo.1` plus one
+`silo-<subcommand>.1` per subcommand (`silo-run.1`, `silo-workspace.1`,
+`silo-shell.1`, `silo-replay-test.1`, `silo-harnesses.1`). The command
+exists for packaging and is hidden from `--help`.
 
 ---
 

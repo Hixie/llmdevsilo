@@ -115,13 +115,21 @@ impl Drop for AttachedWorkspace {
 pub struct WorkspaceManager {
     state_dir: PathBuf,
     strategy: ContainerStrategy,
+    /// Warning recorded at lock time when the default selection chose a
+    /// weaker strategy, e.g. the Linux ext4 image tooling is missing.
+    strategy_hint: Option<String>,
 }
 
 impl WorkspaceManager {
     /// Creates a manager using the default containerization strategy for
-    /// the platform.
+    /// the platform, probing for the required tools.
     pub fn new(state_dir: PathBuf) -> Self {
-        WorkspaceManager::with_strategy(state_dir, ContainerStrategy::default_for_platform())
+        let (strategy, strategy_hint) = strategy::select_for_platform(&strategy::tool_on_path);
+        WorkspaceManager {
+            state_dir,
+            strategy,
+            strategy_hint,
+        }
     }
 
     /// Creates a manager that containerizes new locks with the given
@@ -130,6 +138,7 @@ impl WorkspaceManager {
         WorkspaceManager {
             state_dir,
             strategy,
+            strategy_hint: None,
         }
     }
 
@@ -187,7 +196,7 @@ impl WorkspaceManager {
         let slow_work = (|| -> Result<(ContainerStrategy, Vec<String>), WorkspaceError> {
             let tree = snapshot::snapshot(&canon, &workspace_dir.join(BLOBS_DIR))?;
             snapshot::write_manifest(&workspace_dir.join(MANIFEST_FILE), &tree)?;
-            let mut extra_warnings = Vec::new();
+            let mut extra_warnings: Vec<String> = self.strategy_hint.iter().cloned().collect();
             let mut strategy = self.strategy;
             match strategy {
                 ContainerStrategy::PlainDir => {
@@ -199,6 +208,17 @@ impl WorkspaceManager {
                         strategy = ContainerStrategy::PlainDir;
                         extra_warnings.push(format!(
                             "hdiutil failed ({e}); using the plain-directory strategy instead"
+                        ));
+                        strategy::move_contents(&canon, &workspace_dir.join(DATA_DIR))?;
+                    }
+                }
+                ContainerStrategy::Ext4Fuse => {
+                    if let Err(e) = strategy::lock_into_ext4_image(&canon, &workspace_dir) {
+                        strategy::cleanup_ext4_image(&workspace_dir);
+                        strategy = ContainerStrategy::PlainDir;
+                        extra_warnings.push(format!(
+                            "ext4 image setup failed ({e}); using the plain-directory \
+                             strategy instead"
                         ));
                         strategy::move_contents(&canon, &workspace_dir.join(DATA_DIR))?;
                     }
@@ -321,11 +341,9 @@ impl WorkspaceManager {
 
         // Step 3: release the image mount. A failure aborts the unlock
         // with the registry entry, the snapshot, and the container intact.
-        if entry.strategy == ContainerStrategy::SparseBundle {
-            let (_, mountpoint) = strategy::sparsebundle_paths(&workspace_dir);
-            strategy::detach_image(&mountpoint)
-                .map_err(|e| unlock_step_error("detaching the workspace image", &e.to_string()))?;
-        }
+        let mountpoint = strategy::mountpoint_path(&workspace_dir);
+        strategy::release_mount(entry.strategy, &mountpoint)
+            .map_err(|e| unlock_step_error("detaching the workspace image", &e.to_string()))?;
 
         // Step 4: restore the contents into the original directory.
         fs::create_dir_all(&canon)?;
@@ -345,6 +363,11 @@ impl WorkspaceManager {
             }
             ContainerStrategy::SparseBundle => {
                 strategy::restore_from_sparsebundle(&workspace_dir, &canon).map_err(|e| {
+                    unlock_step_error("restoring the workspace contents", &e.to_string())
+                })?;
+            }
+            ContainerStrategy::Ext4Fuse => {
+                strategy::restore_from_ext4_image(&workspace_dir, &canon).map_err(|e| {
                     unlock_step_error("restoring the workspace contents", &e.to_string())
                 })?;
             }
@@ -371,8 +394,7 @@ impl WorkspaceManager {
 
         // Step 6: the snapshot directory must not be deleted while it
         // still hosts a live mount.
-        let (_, mountpoint) = strategy::sparsebundle_paths(&workspace_dir);
-        strategy::detach_image(&mountpoint)
+        strategy::release_mount(entry.strategy, &mountpoint)
             .map_err(|e| unlock_step_error("detaching the workspace image", &e.to_string()))?;
 
         // Step 7: remove the registry entry.
@@ -571,6 +593,14 @@ fn mount_for_entry(entry: &RegistryEntry, workspace_dir: &Path) -> Result<PathBu
             }
             Ok(mountpoint)
         }
+        ContainerStrategy::Ext4Fuse => {
+            let (image, mountpoint) = strategy::ext4_image_paths(workspace_dir);
+            fs::create_dir_all(&mountpoint)?;
+            if !strategy::is_mountpoint(&mountpoint) {
+                strategy::mount_ext4_image(&image, &mountpoint)?;
+            }
+            Ok(mountpoint)
+        }
     }
 }
 
@@ -583,10 +613,16 @@ fn undo_partial_lock(canon: &Path, workspace_dir: &Path) {
     if data.is_dir() {
         let _ = strategy::move_contents(&data, canon);
     }
-    let (bundle, mountpoint) = strategy::sparsebundle_paths(workspace_dir);
+    let mountpoint = strategy::mountpoint_path(workspace_dir);
+    let (bundle, _) = strategy::sparsebundle_paths(workspace_dir);
     if bundle.exists() {
         let _ = strategy::restore_from_sparsebundle(workspace_dir, canon);
         let _ = strategy::detach_image(&mountpoint);
+    }
+    let (image, _) = strategy::ext4_image_paths(workspace_dir);
+    if image.exists() {
+        let _ = strategy::restore_from_ext4_image(workspace_dir, canon);
+        let _ = strategy::unmount_fuse(&mountpoint);
     }
     if !strategy::is_mountpoint(&mountpoint) {
         let _ = fs::remove_dir_all(workspace_dir);
@@ -621,12 +657,12 @@ fn detach_workspace(state_dir: &Path, key: &str, strategy_kind: ContainerStrateg
         {
             entry.attached = None;
         }
-        let release_mount = strategy_kind == ContainerStrategy::SparseBundle
-            && !has_live_attachments(entry, &process::alive_with_hint);
-        let mountpoint = strategy::sparsebundle_paths(&workspaces_root.join(&entry.id)).1;
+        let release_mount =
+            strategy_kind.uses_image() && !has_live_attachments(entry, &process::alive_with_hint);
+        let mountpoint = strategy::mountpoint_path(&workspaces_root.join(&entry.id));
         registry::save(&workspaces_root, &reg)?;
         if release_mount {
-            strategy::detach_image(&mountpoint)?;
+            strategy::release_mount(strategy_kind, &mountpoint)?;
         }
         Ok(())
     });
@@ -658,12 +694,12 @@ fn detach_shared_workspace(
         {
             entry.secondary_attachments.remove(index);
         }
-        let release_mount = strategy_kind == ContainerStrategy::SparseBundle
-            && !has_live_attachments(entry, &process::alive_with_hint);
-        let mountpoint = strategy::sparsebundle_paths(&workspaces_root.join(&entry.id)).1;
+        let release_mount =
+            strategy_kind.uses_image() && !has_live_attachments(entry, &process::alive_with_hint);
+        let mountpoint = strategy::mountpoint_path(&workspaces_root.join(&entry.id));
         registry::save(&workspaces_root, &reg)?;
         if release_mount {
-            strategy::detach_image(&mountpoint)?;
+            strategy::release_mount(strategy_kind, &mountpoint)?;
         }
         Ok(())
     });
@@ -768,12 +804,48 @@ mod tests {
 
     #[test]
     fn default_strategy_matches_the_platform() {
-        let expected = if cfg!(target_os = "macos") {
-            ContainerStrategy::SparseBundle
+        let default = ContainerStrategy::default_for_platform();
+        if cfg!(target_os = "macos") {
+            assert_eq!(default, ContainerStrategy::SparseBundle);
         } else {
-            ContainerStrategy::PlainDir
+            // On Linux the default depends on whether the ext4 image
+            // tooling is on PATH.
+            assert!(matches!(
+                default,
+                ContainerStrategy::PlainDir | ContainerStrategy::Ext4Fuse
+            ));
+        }
+    }
+
+    #[test]
+    fn the_selection_hint_is_recorded_in_lock_warnings() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = WorkspaceManager {
+            state_dir: temp.path().join("state"),
+            strategy: ContainerStrategy::PlainDir,
+            strategy_hint: Some("install fuse2fs and mkfs.ext4".into()),
         };
-        assert_eq!(ContainerStrategy::default_for_platform(), expected);
+        let ws = temp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        let status = manager.lock(&ws).unwrap();
+        assert!(status
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("file permissions only")));
+        assert!(status
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("install fuse2fs")));
+
+        // The hint is persisted with the registry entry, so later status
+        // reads still carry it.
+        let status = manager.status(&ws).unwrap();
+        assert!(status
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("install fuse2fs")));
+        manager.unlock(&ws).unwrap();
     }
 
     #[test]

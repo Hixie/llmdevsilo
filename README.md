@@ -112,18 +112,28 @@ can connect from then on — or start the harness with `--tls-cert` and
 trusts (for development, [mkcert](https://github.com/FiloSottile/mkcert)
 generates such certificates).
 
+## Installation
+
+The quick start above runs the binaries straight out of
+`target/release`. To install them properly, see
+[docs/INSTALL.md](docs/INSTALL.md), which covers a system-wide install
+(`scripts/install.sh`, binaries plus man pages under `/usr/local`), a
+per-user install under `~/.local` needing no root, the self-contained
+macOS disk image with `Silo.app` and the command-line tools embedded,
+and the relocatable tarball and Debian package builds.
+
 ## Choosing a sandbox
 
 | Backend | Platform | Status | Use case |
 | --- | --- | --- | --- |
 | `sandbox-exec` | macOS | Implemented, integration-tested | Native macOS development (the only practical option for building macOS programs). Seatbelt profile: read-only allowlist, read/write workspace+scratch, network only to the egress proxy. |
 | `gvisor` | Linux | Implemented; runtime validation on a Linux host pending | Strong syscall isolation via runsc; egress only through a relay to the harness proxy. |
-| `linux-vm` | macOS | Designed, scaffolded — not yet runnable | Linux development from a Mac via Virtualization.framework; see docs/sandbox-backends.md. |
-| `microvm` | Linux | Designed, scaffolded — not yet runnable | Firecracker-style hardware isolation; see docs/sandbox-backends.md. |
+| `linux-vm` | macOS | Designed, scaffolded — not yet runnable | Linux development from a Mac via Virtualization.framework; see docs/SANDBOX-BACKENDS.md. |
+| `microvm` | Linux | Designed, scaffolded — not yet runnable | Firecracker-style hardware isolation; see docs/SANDBOX-BACKENDS.md. |
 | `mock` | any | Implemented | Tests: nothing executes, tool calls are validated and answered from a script. |
 
 These are not interchangeable: they have different security tradeoffs,
-documented in [docs/sandbox-backends.md](docs/sandbox-backends.md).
+documented in [docs/SANDBOX-BACKENDS.md](docs/SANDBOX-BACKENDS.md).
 
 ## LLM backends
 

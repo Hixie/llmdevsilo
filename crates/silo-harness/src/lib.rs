@@ -34,6 +34,10 @@ pub struct HarnessOutcome {
     /// Path of the journal written for this session, if the harness created
     /// a journal file.
     pub journal_path: Option<std::path::PathBuf>,
+    /// The last failure message when the session ended through the
+    /// consecutive-LLM-failure path (the headless first failure, or the
+    /// failure cap for other frontends); `None` otherwise.
+    pub llm_failure: Option<String>,
 }
 
 /// Per-run settings that are not part of the persistent [`HarnessConfig`].
@@ -107,12 +111,15 @@ pub async fn run(
         .clone()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."));
-    validate_read_allowlist(
+    let allowlist_warnings = validate_read_allowlist(
         &config.sandbox.read_allowlist,
         &home,
         &state_dir,
         &options.allow_risky_paths,
     )?;
+    for warning in &allowlist_warnings {
+        eprintln!("warning: {warning}");
+    }
 
     let bus = EventBus::new(clock.clone(), journal.clone());
 
@@ -294,7 +301,7 @@ pub async fn run(
 
     // Session: the top-level agent loop runs alongside the upload
     // listener; the listener never completes on its own.
-    let session_result: Result<Option<String>, HarnessError> = {
+    let session_result: Result<agent::SessionEnd, HarnessError> = {
         let agent_counter = AtomicU64::new(1);
         let subagent_slots = Semaphore::new(agent::MAX_CONCURRENT_SUBAGENTS);
         let ctx = agent::SessionCtx {
@@ -323,7 +330,15 @@ pub async fn run(
     }
 
     match session_result {
-        Ok(message) => {
+        Ok(end) => {
+            // A session ended by consecutive LLM failures carries the
+            // failure in the outcome; frontends get no final message for
+            // it (the failures were already surfaced as Error events).
+            let final_message = if end.llm_failure.is_some() {
+                None
+            } else {
+                end.message.clone()
+            };
             finish(
                 Some(&bus),
                 &journal,
@@ -331,12 +346,13 @@ pub async fn run(
                 Some(sandbox),
                 Some(proxy),
                 Some(attached),
-                message.clone(),
+                final_message,
             )
             .await?;
             Ok(HarnessOutcome {
-                message,
+                message: end.message,
                 journal_path,
+                llm_failure: end.llm_failure,
             })
         }
         Err(error) => {

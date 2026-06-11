@@ -13,6 +13,9 @@ use crate::cli::RunArgs;
 
 pub async fn execute(args: RunArgs) -> anyhow::Result<u8> {
     let config = crate::cli::build_run_config(&args)?;
+    for warning in crate::cli::startup_warnings(&config) {
+        eprintln!("warning: {warning}");
+    }
     let state_dir = silo_core::paths::state_dir();
 
     let script = match &args.script {
@@ -80,8 +83,10 @@ pub async fn execute(args: RunArgs) -> anyhow::Result<u8> {
     };
 
     let outcome = silo_harness::run(config, options).await?;
-    // The headless frontend prints the final message itself.
-    if !headless {
+    if let Some(failure) = &outcome.llm_failure {
+        eprintln!("silo: session ended by LLM failure: {failure}");
+    } else if !headless {
+        // The headless frontend prints the final message itself.
         if let Some(message) = &outcome.message {
             println!("{message}");
         }
@@ -89,5 +94,37 @@ pub async fn execute(args: RunArgs) -> anyhow::Result<u8> {
     if let Some(path) = &outcome.journal_path {
         eprintln!("journal: {}", path.display());
     }
-    Ok(0)
+    Ok(exit_code(&outcome))
+}
+
+/// Maps the harness outcome to the process exit code: 3 when the session
+/// was ended by consecutive LLM failures, 0 otherwise.
+fn exit_code(outcome: &silo_harness::HarnessOutcome) -> u8 {
+    if outcome.llm_failure.is_some() {
+        3
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use silo_harness::HarnessOutcome;
+
+    #[test]
+    fn llm_failure_maps_to_exit_code_3() {
+        let normal = HarnessOutcome {
+            message: Some("done".into()),
+            ..HarnessOutcome::default()
+        };
+        assert_eq!(exit_code(&normal), 0);
+
+        let failed = HarnessOutcome {
+            message: Some("quota exceeded".into()),
+            llm_failure: Some("quota exceeded".into()),
+            ..HarnessOutcome::default()
+        };
+        assert_eq!(exit_code(&failed), 3);
+    }
 }

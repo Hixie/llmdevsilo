@@ -77,16 +77,16 @@ pub fn known_risky_paths(home: &Path, state_dir: &Path) -> Vec<(PathBuf, &'stati
     risks
 }
 
-fn normalize(path: &Path) -> PathBuf {
-    // Canonicalize so symlinked entries are compared by their real
-    // location. For nonexistent paths, canonicalize the nearest existing
-    // ancestor and reattach the remainder.
+/// Canonicalizes a path so entries are compared by their real location:
+/// symlinks resolve, and for nonexistent paths the nearest existing
+/// ancestor is canonicalized and the remainder reattached.
+pub fn normalize_path(path: &Path) -> PathBuf {
     if let Ok(real) = std::fs::canonicalize(path) {
         return real;
     }
     if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
         if !parent.as_os_str().is_empty() {
-            return normalize(parent).join(name);
+            return normalize_path(parent).join(name);
         }
     }
     path.to_path_buf()
@@ -96,13 +96,13 @@ fn normalize(path: &Path) -> PathBuf {
 /// known-sensitive path. A hit is reported when the entry equals, contains,
 /// or is contained in a sensitive path that exists.
 pub fn scan_allowlist_entry(entry: &Path, home: &Path, state_dir: &Path) -> Vec<RiskHit> {
-    let entry = normalize(entry);
+    let entry = normalize_path(entry);
     let mut hits = Vec::new();
     for (risky, reason) in known_risky_paths(home, state_dir) {
         if !risky.exists() {
             continue;
         }
-        let risky = normalize(&risky);
+        let risky = normalize_path(&risky);
         if risky.starts_with(&entry) || entry.starts_with(&risky) {
             hits.push(RiskHit {
                 path: risky,

@@ -32,7 +32,8 @@ anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "string"] }
+clap_mangen = "0.2"
 crossterm = "0.28"
 dirs = "6"
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8", "pem"] }

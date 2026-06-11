@@ -182,3 +182,95 @@ host loopback services are unreachable from the guest.
 | Host loopback reachable from sandbox | yes (noted in report) | no | no | no |
 | DNS inside the sandbox | host resolver, egress blocked | none (proxy resolves) | none (proxy resolves) | none (proxy resolves) |
 | Status | implemented | scaffold | implemented (untested on Linux hosts) | scaffold |
+
+## Workspace locking
+
+Workspace locking lives in `crates/silo-workspace`, not in the sandbox
+backends, but it is the other half of the containment story: the sandbox
+controls what the agent can reach while a session runs, and the lock
+controls where the workspace contents live while the workspace is handed
+over. Locking snapshots every file for the unlock diff and then moves the
+contents into a container under the harness state directory. Three
+container strategies exist. The registry records the strategy chosen at
+lock time, and an existing lock keeps its recorded strategy regardless of
+later platform or tooling changes.
+
+One honest framing applies to all three strategies: none of them is a
+cryptographic or kernel-enforced boundary against the host user. The
+contents always live somewhere the same user account can reach. The
+lock's purpose is procedural — it keeps the contents out of casual reach
+(editors, indexers, build tools, muscle-memory shell commands) so the
+unlock report is a complete account of what changed while the workspace
+was locked.
+
+### sparsebundle (macOS default)
+
+`hdiutil` creates a sparse bundle disk image
+(`<state>/workspaces/<id>/workspace.sparsebundle`) with an APFS
+filesystem, and the contents are copied in. The image grows on demand.
+The image is mounted at `<state>/workspaces/<id>/mnt` only while a
+harness or shell is attached; one primary harness attachment plus any
+number of secondary shell attachments share the mount, and the last live
+attachment to detach releases it.
+
+What it protects against: while no session runs, the contents are not
+present as plain files anywhere — host-side tools cannot touch them
+without explicitly mounting the image. What it does not protect against:
+while attached, the mounted volume is host-visible and writable by the
+same user (the recorded warning says exactly this), and a deliberate
+host-side `hdiutil attach` between sessions bypasses the lock entirely.
+
+### ext4 + fuse2fs (Linux default when the tools are present)
+
+Selected when both `fuse2fs` and `mkfs.ext4` are found on `PATH` at lock
+time. Locking creates a raw disk image
+(`<state>/workspaces/<id>/workspace.img`), formats it as ext4 without a
+journal, mounts it with `fuse2fs` — a user-space mount, no root required
+— copies the contents in, and unmounts (`fusermount -u`, falling back to
+`fusermount3`). Attach and detach mount and unmount the image at
+`<state>/workspaces/<id>/mnt`, with the same shared-attachment rules as
+the sparse bundle: primary plus secondaries share one mount, and the
+last live attachment releases it.
+
+The image size is fixed at lock time: twice the content size plus
+256 MiB of headroom, with a 1 GiB minimum. The image does not grow; a
+session that outgrows it sees out-of-space errors inside the workspace.
+This is a known limitation, and the recorded warning states it.
+
+What it protects against and does not protect against: the same as the
+sparse bundle. While attached the FUSE mount is host-visible (by default
+FUSE restricts access to the mounting user, which is also the user
+running the harness), and a host-side `fuse2fs` invocation between
+sessions bypasses the lock.
+
+### plain directory (fallback)
+
+Used on Linux when the ext4 tooling is missing, on macOS when `hdiutil`
+fails, for `--deterministic` locks, and on any other platform. The
+contents move to `<state>/workspaces/<id>/data/` as ordinary files,
+protected by file permissions only. The recorded warning says so, and on
+Linux a second warning suggests installing `fuse2fs` and `mkfs.ext4`
+(the `fuse2fs` and `e2fsprogs` packages) to get the image strategy.
+
+This is the weakest container: the contents are always present as plain
+files the host user can read and modify, attached or not. Host-side
+modification while locked silently corrupts the premise of the unlock
+report (the diff cannot distinguish agent changes from host changes).
+
+### Future: in-sandbox-only mounting on Linux
+
+This section describes a design that is not implemented.
+
+The fixed-size and host-visible caveats above could both be removed on
+Linux by giving the mount to the sandbox alone. The design: a dedicated
+mount holder process creates a private user namespace plus mount
+namespace pair, mounts the workspace image there, and lends the mounted
+filesystem to the sandbox (for example by file-descriptor passing of a
+detached mount, or by moving the mount into the sandbox's own mount
+namespace). The mounted filesystem then never appears in the host's
+mount namespace at all: the host sees only the opaque image file, and
+the only path to the live contents runs through the sandbox boundary.
+The mount holder would also own growing the image on demand. This pairs
+naturally with the microvm backend, where the image can instead be
+attached directly as a virtio-blk device and never mounted host-side in
+any form.
