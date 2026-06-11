@@ -222,7 +222,7 @@ pub(crate) fn percent_encode(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Hand-written fixture mirroring the html.duckduckgo.com result
+    /// Fixture mirroring the html.duckduckgo.com result
     /// markup: redirect-wrapped hrefs, entities in titles, markup in
     /// snippets.
     const RESULTS_PAGE: &str = r#"<!DOCTYPE html>

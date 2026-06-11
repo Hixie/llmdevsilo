@@ -83,7 +83,9 @@ pub async fn execute(args: RunArgs) -> anyhow::Result<u8> {
     };
 
     let outcome = silo_harness::run(config, options).await?;
-    if let Some(failure) = &outcome.llm_failure {
+    if let Some(failure) = &outcome.script_failure {
+        eprintln!("silo: script failure: {failure}");
+    } else if let Some(failure) = &outcome.llm_failure {
         eprintln!("silo: session ended by LLM failure: {failure}");
     } else if !headless {
         // The headless frontend prints the final message itself.
@@ -97,10 +99,13 @@ pub async fn execute(args: RunArgs) -> anyhow::Result<u8> {
     Ok(exit_code(&outcome))
 }
 
-/// Maps the harness outcome to the process exit code: 3 when the session
+/// Maps the harness outcome to the process exit code: 4 when the test
+/// script failed (a mismatch or unconsumed entries), 3 when the session
 /// was ended by consecutive LLM failures, 0 otherwise.
 fn exit_code(outcome: &silo_harness::HarnessOutcome) -> u8 {
-    if outcome.llm_failure.is_some() {
+    if outcome.script_failure.is_some() {
+        4
+    } else if outcome.llm_failure.is_some() {
         3
     } else {
         0
@@ -126,5 +131,23 @@ mod tests {
             ..HarnessOutcome::default()
         };
         assert_eq!(exit_code(&failed), 3);
+    }
+
+    #[test]
+    fn script_failure_maps_to_exit_code_4() {
+        let failed = HarnessOutcome {
+            script_failure: Some("llm script mismatch: llm script exhausted".into()),
+            ..HarnessOutcome::default()
+        };
+        assert_eq!(exit_code(&failed), 4);
+
+        // A script failure outranks an LLM failure recorded by the same
+        // session.
+        let both = HarnessOutcome {
+            llm_failure: Some("quota exceeded".into()),
+            script_failure: Some("script entries left unconsumed".into()),
+            ..HarnessOutcome::default()
+        };
+        assert_eq!(exit_code(&both), 4);
     }
 }

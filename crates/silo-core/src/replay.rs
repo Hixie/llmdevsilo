@@ -2,7 +2,7 @@
 //!
 //! A [`TestScript`] drives the mock LLM backend, the mock sandbox, the mock
 //! frontend, and (optionally) the mock proxy through one session. Scripts
-//! can be written by hand or generated from a journal with
+//! can be authored directly or generated from a journal with
 //! [`script_from_journal`], which is how a recorded session becomes a
 //! regression test. Mock components consume their portion of a
 //! [`SharedScript`] strictly in order — sequencing is by script position,

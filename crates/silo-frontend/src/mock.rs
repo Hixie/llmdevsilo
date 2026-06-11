@@ -145,11 +145,18 @@ impl Frontend for MockFrontend {
     async fn next_user_input(&self) -> Result<String, FrontendError> {
         let started = self.require_started()?;
         loop {
-            match self.script.next_frontend() {
+            // Peek so a step that does not belong in the input position
+            // (an answer or a shutdown step) is left on the script with
+            // the cursor still pointing at it: the harness then sees the
+            // divergence as unconsumed script, which classifies as a
+            // script failure rather than a clean exhaustion.
+            match self.script.peek_frontend() {
                 Some(FrontendStep::ExpectEvent { kind, contains }) => {
+                    self.script.next_frontend();
                     self.wait_for_event(&kind, contains.as_deref()).await;
                 }
                 Some(FrontendStep::UploadFile { name, content_b64 }) => {
+                    self.script.next_frontend();
                     // The harness upload listener stores the upload through
                     // a scripted sandbox Write on another task. This step
                     // completes once that execution has been consumed, so
@@ -166,8 +173,12 @@ impl Frontend for MockFrontend {
                         tokio::task::yield_now().await;
                     }
                 }
-                Some(FrontendStep::SendPrompt { text }) => return Ok(text),
+                Some(FrontendStep::SendPrompt { text }) => {
+                    self.script.next_frontend();
+                    return Ok(text);
+                }
                 Some(FrontendStep::Interrupt) => {
+                    self.script.next_frontend();
                     // An interrupt while the harness is idle: send the
                     // command and continue with the next step.
                     started

@@ -68,6 +68,7 @@ output (reports, connection details, final messages).
 | 1 | A runtime error. The message is printed to standard error, prefixed `silo:`. |
 | 2 | A command-line usage error (unknown flag, missing argument, bad value). |
 | 3 | `silo run` only: the session was ended by repeated LLM failures (for example an exhausted quota) — the first failure for the headless frontend, the eighth consecutive failed turn for the others. The failure message is printed to standard error, not standard output. |
+| 4 | `silo run` with `--script` only: the test script failed — a mock component reported a mismatch, or script entries were left unconsumed at session end. The detail is printed to standard error as `silo: script failure: <detail>; remaining: <summary>`, where the summary counts consumed versus scripted entries per list. Exit code 0 from a scripted run means the script was consumed exactly. |
 | other | `silo shell` exits with the sandboxed shell's or command's own exit code (clamped to the 0–255 range). |
 
 ### The no-remote-secrets configuration model
@@ -111,6 +112,14 @@ the end, the final message (if any) is printed to standard output and the
 journal path is printed to standard error as `journal: <path>`. A session
 ended by repeated LLM failures instead prints the failure message to
 standard error and exits with code 3 (see the exit-code table above).
+
+Scripted runs (`--script` with mock components) are additionally
+self-checking: a script mismatch ends the session immediately, entries
+the session never consumed fail it at the end, and either failure prints
+`script failure: <detail>; remaining: <summary>` to standard error and
+exits with code 4. Exit code 0 from a scripted run means the script was
+consumed exactly. See "When a replay diverges" in
+[REPLAY.md](REPLAY.md).
 
 The defaults select a real session: the LLM backend is chosen from the
 environment (see the LLM backend flags below) and the sandbox defaults to
@@ -365,6 +374,10 @@ These exist for the replay-testing surface described in
 - `--script <SCRIPT>` — a test script (JSON, the
   `silo_core::replay::TestScript` shape). Required when any mock
   component is selected (frontend, LLM, or sandbox); ignored otherwise.
+  The run is self-checking: a script mismatch, or entries left
+  unconsumed at session end, exits with code 4 and the detail plus a
+  remaining-entry summary on standard error; exit code 0 means the
+  script was consumed exactly.
 - `--journal <JOURNAL>` — write the session journal to this path instead
   of `<state>/journals/<harness-id>.jsonl`. The path is validated
   against the read allowlist: a journal that the sandbox could read
@@ -814,6 +827,12 @@ wall-clock timing collapses to sequence order. What is verified is the
 recorded interaction order and content — not timing, not the behavior
 of the real model, sandbox, or network.
 
+The replay verifies itself: a divergence from the script, or script
+entries the replay never consumed, make `silo run` exit with code 4 and
+print the detail with a remaining-entry summary to standard error. Exit
+code 0 means the replay consumed the script exactly. See "When a replay
+diverges" in [REPLAY.md](REPLAY.md).
+
 ### Files read and written
 
 Reads the journal; writes the script to `--output`. Nothing else.
@@ -903,7 +922,7 @@ the file unreadable and older than a minute) removes the stale file and
 retries. If a *live* process genuinely holds the lock for more than
 about thirty seconds, commands fail with *"timed out waiting for the
 workspace registry lock at <path>"*; check what that process is before
-removing the file by hand.
+removing the file manually.
 
 **A wedged unlock.** Unlock failures name the failing step and end with
 *"the workspace is unchanged for this step — re-run unlock to resume"*.

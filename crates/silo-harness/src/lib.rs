@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use silo_core::clock::{FakeClock, RealClock, SharedClock};
 use silo_core::config::{HarnessConfig, SandboxKind};
-use silo_core::error::HarnessError;
+use silo_core::error::{FrontendError, HarnessError};
 use silo_core::event::{EventBus, EventPayload};
 use silo_core::journal::{JournalEntry, JournalHandle, JournalWriter};
 use silo_core::replay::SharedScript;
@@ -38,6 +38,12 @@ pub struct HarnessOutcome {
     /// consecutive-LLM-failure path (the headless first failure, or the
     /// failure cap for other frontends); `None` otherwise.
     pub llm_failure: Option<String>,
+    /// Why the scripted session failed, when a script was supplied: a mock
+    /// LLM or sandbox mismatch ended the session, or script entries were
+    /// left unconsumed at session end. Carries the mismatch detail (when
+    /// there is one) and the remaining-entry summary. `None` when the
+    /// script was consumed exactly, or when no script was supplied.
+    pub script_failure: Option<String>,
 }
 
 /// Per-run settings that are not part of the persistent [`HarnessConfig`].
@@ -331,15 +337,15 @@ pub async fn run(
 
     match session_result {
         Ok(end) => {
-            // A session ended by consecutive LLM failures carries the
-            // failure in the outcome; frontends get no final message for
-            // it (the failures were already surfaced as Error events).
-            let final_message = if end.llm_failure.is_some() {
+            // A session ended by consecutive LLM failures or a script
+            // mismatch carries the failure in the outcome; frontends get
+            // no final message for it.
+            let final_message = if end.llm_failure.is_some() || end.script_mismatch.is_some() {
                 None
             } else {
                 end.message.clone()
             };
-            finish(
+            let finish_result = finish(
                 Some(&bus),
                 &journal,
                 Some(frontend),
@@ -348,11 +354,50 @@ pub async fn run(
                 Some(attached),
                 final_message,
             )
-            .await?;
+            .await;
+            // Scripted sessions are self-checking: a mismatch ending is a
+            // script failure, and so is any script entry left unconsumed
+            // at session end. The check runs after `finish` so a trailing
+            // ExpectShutdown step has been consumed. A script mismatch
+            // raised by `finish` itself (for example a trailing
+            // ExpectShutdown whose message check fails because the failure
+            // suppressed the final message) folds into the same script
+            // failure rather than masking it as a generic error.
+            let finish_script_mismatch = matches!(
+                &finish_result,
+                Err(HarnessError::Frontend(FrontendError::ScriptMismatch(_)))
+            );
+            // Propagate a finish error unless it is the expected script
+            // mismatch on a scripted run, which is folded into the script
+            // failure below.
+            if !(options.script.is_some() && finish_script_mismatch) {
+                finish_result?;
+            }
+            let script_failure = options.script.as_ref().and_then(|script| {
+                if let Some(detail) = &end.script_mismatch {
+                    Some(format!(
+                        "{detail}; remaining: {}",
+                        script.remaining_summary()
+                    ))
+                } else if finish_script_mismatch {
+                    Some(format!(
+                        "frontend shutdown step did not match; remaining: {}",
+                        script.remaining_summary()
+                    ))
+                } else if script.finished() {
+                    None
+                } else {
+                    Some(format!(
+                        "script entries left unconsumed; remaining: {}",
+                        script.remaining_summary()
+                    ))
+                }
+            });
             Ok(HarnessOutcome {
                 message: end.message,
                 journal_path,
                 llm_failure: end.llm_failure,
+                script_failure,
             })
         }
         Err(error) => {

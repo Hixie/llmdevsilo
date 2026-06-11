@@ -10,7 +10,7 @@ use silo_core::conversation::{
     AgentId, AgentKind, CompletionRequest, CompletionResponse, ContentBlock, Message, Role,
     StopReason,
 };
-use silo_core::error::{FrontendError, HarnessError};
+use silo_core::error::{FrontendError, HarnessError, LlmError, SandboxError};
 use silo_core::event::{EventBus, EventPayload};
 use silo_core::journal::{JournalEntry, JournalHandle};
 use silo_core::tool::{ToolCall, ToolOutput, ToolOwner, ToolRegistry, INTERRUPTED_BY_USER};
@@ -54,6 +54,9 @@ pub(crate) enum TurnOutcome {
     /// The LLM request failed; an Error event has been emitted. The message
     /// is the error's display form.
     LlmFailed(String),
+    /// A mock component reported a script mismatch. The session ends
+    /// immediately; the message is the mismatch detail.
+    ScriptFailed(String),
 }
 
 enum ToolDisposition {
@@ -65,6 +68,8 @@ enum ToolDisposition {
     /// The tool call was ended by an interrupt without producing a result;
     /// the caller records a synthetic interrupted result for it.
     Interrupted,
+    /// The tool call hit a script mismatch; the session ends.
+    ScriptFailed(String),
 }
 
 /// Runs the conversation until the model stops calling tools, an LLM error
@@ -122,6 +127,16 @@ pub(crate) fn drive<'c>(
             };
             let response = match completion {
                 Ok(response) => response,
+                Err(error @ LlmError::ScriptMismatch(_)) => {
+                    // A script mismatch is a failure of the test script, not
+                    // of the backend: the session ends at once, with no
+                    // Error event and no failure counting.
+                    let message = error.to_string();
+                    ctx.journal.append(JournalEntry::Lifecycle {
+                        message: format!("llm script mismatch for {agent}: {message}"),
+                    });
+                    return Ok(TurnOutcome::ScriptFailed(message));
+                }
                 Err(error) => {
                     let message = error.to_string();
                     ctx.journal.append(JournalEntry::Lifecycle {
@@ -209,6 +224,9 @@ pub(crate) fn drive<'c>(
                     ToolDisposition::Interrupted => {
                         interrupted = true;
                         break;
+                    }
+                    ToolDisposition::ScriptFailed(message) => {
+                        return Ok(TurnOutcome::ScriptFailed(message))
                     }
                 }
             }
@@ -323,6 +341,15 @@ async fn run_sandbox_tool(
             owner: "sandbox",
             output,
         }),
+        Err(error @ SandboxError::ScriptMismatch(_)) => {
+            // A script mismatch ends the session as a script failure, not
+            // as a harness error.
+            let message = error.to_string();
+            ctx.journal.append(JournalEntry::Lifecycle {
+                message: format!("sandbox script mismatch for {agent}: {message}"),
+            });
+            Ok(ToolDisposition::ScriptFailed(message))
+        }
         Err(error) => {
             ctx.bus.emit(EventPayload::Error {
                 context: format!("sandbox tool {}", call.name),
@@ -357,6 +384,13 @@ async fn run_frontend_tool(
             };
             let read_output = match ctx.sandbox.run_tool(agent, &read_call).await {
                 Ok(output) => output,
+                Err(error @ SandboxError::ScriptMismatch(_)) => {
+                    let message = error.to_string();
+                    ctx.journal.append(JournalEntry::Lifecycle {
+                        message: format!("sandbox script mismatch for {agent}: {message}"),
+                    });
+                    return Ok(ToolDisposition::ScriptFailed(message));
+                }
                 Err(error) => {
                     ctx.bus.emit(EventPayload::Error {
                         context: "sandbox tool Read (SendUserFile)".into(),
@@ -510,6 +544,14 @@ async fn run_agent_tool(
                 output: ToolOutput::error(message),
             })
         }
+        TurnOutcome::ScriptFailed(message) => {
+            ctx.bus.emit(EventPayload::AgentCompleted {
+                agent: sub_id,
+                result: message.clone(),
+                is_error: true,
+            });
+            Ok(ToolDisposition::ScriptFailed(message))
+        }
         TurnOutcome::Interrupted => {
             // The parent loop records the synthetic interrupted result for
             // this Agent tool use and unwinds.
@@ -538,6 +580,9 @@ pub(crate) struct SessionEnd {
     /// The last failure message when the session ended through the
     /// consecutive-LLM-failure path.
     pub llm_failure: Option<String>,
+    /// The mismatch detail when the session ended on an LLM or sandbox
+    /// script mismatch.
+    pub script_mismatch: Option<String>,
 }
 
 impl SessionEnd {
@@ -545,6 +590,7 @@ impl SessionEnd {
         SessionEnd {
             message,
             llm_failure: None,
+            script_mismatch: None,
         }
     }
 }
@@ -654,9 +700,20 @@ pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<SessionEnd, H
                             return Ok(SessionEnd {
                                 message: Some(message.clone()),
                                 llm_failure: Some(message),
+                                script_mismatch: None,
                             });
                         }
                         continue;
+                    }
+                    TurnOutcome::ScriptFailed(message) => {
+                        ctx.journal.append(JournalEntry::Lifecycle {
+                            message: format!("session ended by a script mismatch: {message}"),
+                        });
+                        return Ok(SessionEnd {
+                            message: None,
+                            llm_failure: None,
+                            script_mismatch: Some(message),
+                        });
                     }
                     TurnOutcome::ShutdownRequested => {
                         return Ok(SessionEnd::normal(

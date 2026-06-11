@@ -4,7 +4,7 @@ Every harness session writes a journal: a typed, append-only record of
 everything the modules said to each other. A journal converts into a
 test script, and a test script drives the mock components through an
 exact, deterministic rerun of the session — no model calls, no code
-execution, no network. The same script format can also be written by
+execution, no network. The same script format can also be authored directly by
 hand to describe a session that never happened, which is how this
 repository's own end-to-end tests work.
 
@@ -163,7 +163,7 @@ Each entry answers one completion request:
   content in the request is treated as text — so after a tool call,
   the next turn's expectation can match the tool's output (the worked
   example below matches `"src"`, the scripted output of its Bash
-  call). Generated scripts leave this unset; set it in hand-written
+  call). Generated scripts leave this unset; set it in directly authored
   scripts to pin down what the "model" is responding to.
 - `response.content`: a list of blocks, each `{"type": "text", ...}`
   or `{"type": "tool_use", "id": ..., "name": ..., "input": ...}`.
@@ -255,36 +255,40 @@ timestamps) and disables operating-system signal handling.
 
 ### When a replay diverges
 
-A divergence is reported where it happens, with the cursor position
-and the expected versus actual values. How it surfaces from `silo run`
-depends on which list diverged:
+A scripted run is self-checking. A divergence fails the run: `silo run`
+exits with code 4 and prints
+`silo: script failure: <detail>; remaining: <summary>` to standard
+error, where the detail names the diverging list and cursor position
+with the expected versus actual values, and the summary counts consumed
+versus scripted entries per list (for example
+`llm 1/2, tools 1/1, frontend 2/2`). The checks:
 
-- **A sandbox tool mismatch** (wrong name, input that fails the subset
-  match, or an exhausted `tools` list) fails the session: exit code 1
-  and `silo: sandbox script mismatch: tool exec 0 (Bash): input ...
-  does not match expectation ...` on standard error.
 - **An LLM turn mismatch** (a failed `expect_user_contains`, or an
-  exhausted `llm` list) is treated like any other LLM failure: an
-  `error` event, and the harness returns to awaiting input. The replay
-  then normally ends through the next point, below.
-- **A frontend mismatch while the harness waits for input** (the next
-  step is not one that can supply input, or the list is exhausted)
-  ends the session with the final message `frontend script exhausted`
-  and exit code 0. The mismatch detail is in the journal.
-- **An `expect_shutdown` or `answer_question` mismatch** fails the
-  session with exit code 1 and the mismatch detail on standard error.
+  exhausted `llm` list) ends the session immediately. It is a failure
+  of the script, not of the backend, so it produces no `error` event,
+  no return to awaiting input, and no LLM-failure counting.
+- **A sandbox tool mismatch** (wrong name, input that fails the subset
+  match, or an exhausted `tools` list) likewise ends the session
+  immediately.
+- **At session end** — a normal shutdown, the Exit tool, or the mock
+  frontend running out of steps when asked for input — every script
+  list must be fully consumed. Entries the session never reached fail
+  the run with the remaining-entry summary.
 
-Two consequences worth knowing. First, an exhausted or mismatched
-`llm` list often shows up as `frontend script exhausted` on standard
-output rather than a nonzero exit code — when scripting a replay
-check, compare the final message, not just the exit code. Second,
-trailing entries that the session never reaches are not flagged by
-`silo run`; the repository's own tests assert full consumption
-explicitly (section 7).
+Exit code 0 from a scripted run therefore means the session consumed
+the script exactly: every turn, tool execution, and frontend step, in
+order, with nothing left over.
+
+Two frontend mismatches surface as ordinary runtime errors (exit code
+1, message on standard error) rather than as script failures: a
+pending `AskUserQuestion` the script cannot answer (a failed
+`contains` filter, a non-answer step next, or an exhausted list), and
+an `expect_shutdown` step whose `message_contains` does not match the
+final message.
 
 ---
 
-## 5. A worked example, written by hand
+## 5. A worked example
 
 One prompt, one Bash call, then the model exits. Save this as
 `hello.json`:
@@ -358,8 +362,9 @@ done: listed the workspace
 journal: /tmp/replay-demo/state/journals/11495edb10f7.jsonl
 ```
 
-The final message lands on standard output and the exit code is 0. The
-session wrote a real journal, so the round trip works on it too:
+The final message lands on standard output and the exit code is 0,
+which also certifies that every script entry was consumed (section 4).
+The session wrote a real journal, so the round trip works on it too:
 
 ```sh
 silo replay-test /tmp/replay-demo/state/journals/11495edb10f7.jsonl -o generated.json
@@ -375,7 +380,7 @@ done: listed the workspace
 journal: /tmp/replay-demo/state/journals/f958211b566d.jsonl
 ```
 
-The generated script is the hand-written one minus the
+The generated script is the directly authored one minus the
 `expect_user_contains` lines, with the recorded shutdown message
 (`"done: listed the workspace"`) as the `expect_shutdown` expectation.
 The second run needs no `--create` because the workspace is already
@@ -414,7 +419,7 @@ silo workspace unlock /tmp/replay-demo/ws
   shared list in whatever order the agents reach the backend. Replays
   of mock-recorded sessions are ordered by construction; a journal
   recorded from a real session whose subagents genuinely raced may
-  need its turn order untangling by hand before it replays cleanly.
+  need its turn order untangled before it replays cleanly.
 
 ---
 
@@ -425,8 +430,9 @@ exactly this shape, built in code rather than JSON: each test
 constructs a `TestScript`, runs a full harness session against the
 mock components (fake clock, temporary state directory, in-memory
 journal), and asserts on the outcome, the event stream, and the
-journal — including `assert!(script.finished())`, which catches
-scripted entries the session never consumed. The round-trip tests
+journal. The harness checks full script consumption itself at session
+end (the outcome's `script_failure` field, section 4); many tests also
+assert `script.finished()` directly. The round-trip tests
 (`replay_roundtrip.rs`, `interrupt_session.rs`, `upload_session.rs`)
 additionally regenerate a script from the recorded journal with
 `script_from_journal` and verify the replay matches the recording.
@@ -444,9 +450,10 @@ journal and keep the script:
 silo replay-test ~/.llmdevsilo/journals/<id>.jsonl -o quota-bug.json --name quota_bug
 ```
 
-then replay it (in continuous integration, or by hand) with the mock
-command line from section 5 and check that the final message on
-standard output is the one you recorded. Editing the generated script
-is normal: trim turns that are irrelevant to the regression, loosen
+then replay it (in continuous integration, or locally) with the mock
+command line from section 5 and check the exit code: 0 means the
+replay consumed the script exactly, and 4 means it diverged, with the
+detail and the remaining-entry summary on standard error. Editing the
+generated script is normal: trim turns that are irrelevant to the regression, loosen
 `expect_input` to the keys that matter, or add `expect_user_contains`
 to pin the conversation down at the points you care about.

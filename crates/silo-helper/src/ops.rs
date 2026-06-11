@@ -258,7 +258,9 @@ async fn exec(
                 return Err(format!("wait for child failed: {e}"));
             }
             Err(_) => {
-                let _ = child.kill().await;
+                // Kill the whole process group, like cancellation, so a
+                // timed-out shell does not leave descendants running.
+                kill_child_group(&mut child).await;
                 (-1, true)
             }
         },
