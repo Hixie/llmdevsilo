@@ -1,5 +1,6 @@
-//! Subagent flow: the top-level agent delegates work through the Agent
-//! tool, and the subagent's final text comes back as the tool result.
+//! Subagent flow: the top-level agent spawns a subagent through the Agent
+//! tool (which returns at once with the subagent's id), then collects the
+//! subagent's report with AwaitAgent, and the report feeds the next turn.
 
 mod common;
 
@@ -11,11 +12,12 @@ use silo_core::journal::JournalEntry;
 use silo_core::replay::{FrontendStep, TestScript};
 
 #[tokio::test]
-async fn subagent_result_feeds_the_parent_turn() {
+async fn spawn_then_await_feeds_the_parent_turn() {
     let fixture = common::Fixture::new();
     let script = common::shared(TestScript {
         name: "subagent_session".into(),
         llm: vec![
+            // Top level: spawn the subagent. The Agent call returns at once.
             common::llm_turn(
                 Some("do it"),
                 Some("Delegating."),
@@ -27,7 +29,16 @@ async fn subagent_result_feeds_the_parent_turn() {
                 StopReason::ToolUse,
                 TokenDelta::default(),
             ),
-            // Consumed by the subagent, seeded with the Agent prompt.
+            // Top level again: the Agent result reports the subagent
+            // started; now collect it with AwaitAgent.
+            common::llm_turn(
+                Some("runs in the background"),
+                Some("Collecting."),
+                &[("t2", "AwaitAgent", json!({}))],
+                StopReason::ToolUse,
+                TokenDelta::default(),
+            ),
+            // The subagent's own turn, seeded with the Agent prompt.
             common::llm_turn(
                 Some("sub work"),
                 Some("sub result"),
@@ -35,12 +46,12 @@ async fn subagent_result_feeds_the_parent_turn() {
                 StopReason::EndTurn,
                 TokenDelta::default(),
             ),
-            // Back on the top level: the tool result carries the subagent
-            // text.
+            // Back on the top level: the AwaitAgent result carries the
+            // subagent's final text and its id/name.
             common::llm_turn(
                 Some("sub result"),
                 Some("Wrapping up."),
-                &[("t2", "Exit", json!({"message": "subagent done"}))],
+                &[("t3", "Exit", json!({"message": "subagent done"}))],
                 StopReason::ToolUse,
                 TokenDelta::default(),
             ),
@@ -105,7 +116,10 @@ async fn subagent_result_feeds_the_parent_turn() {
         vec![("agent-1".to_string(), "sub result".to_string(), false)]
     );
 
-    // The Agent tool execution is journaled with owner "harness".
+    // Both the Agent spawn and the AwaitAgent collection are journaled with
+    // owner "harness". The Agent result reports the subagent started and
+    // carries its id; the AwaitAgent result carries the subagent's id, name,
+    // and final text.
     let harness_execs: Vec<_> = fixture
         .records()
         .into_iter()
@@ -119,8 +133,19 @@ async fn subagent_result_feeds_the_parent_turn() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        harness_execs,
-        vec![("Agent".to_string(), "sub result".to_string())]
+    assert_eq!(harness_execs.len(), 2, "execs: {harness_execs:?}");
+    assert_eq!(harness_execs[0].0, "Agent");
+    assert!(
+        harness_execs[0].1.contains("agent-1") && harness_execs[0].1.contains("background"),
+        "agent result: {}",
+        harness_execs[0].1
+    );
+    assert_eq!(harness_execs[1].0, "AwaitAgent");
+    assert!(
+        harness_execs[1].1.contains("agent-1")
+            && harness_execs[1].1.contains("sub task")
+            && harness_execs[1].1.contains("sub result"),
+        "await result: {}",
+        harness_execs[1].1
     );
 }

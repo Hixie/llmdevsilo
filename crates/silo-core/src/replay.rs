@@ -4,9 +4,21 @@
 //! frontend, and (optionally) the mock proxy through one session. Scripts
 //! can be authored directly or generated from a journal with
 //! [`script_from_journal`], which is how a recorded session becomes a
-//! regression test. Mock components consume their portion of a
-//! [`SharedScript`] strictly in order — sequencing is by script position,
-//! never by timers — so replays are race-free.
+//! regression test. Sequencing never uses timers, so replays are race-free.
+//!
+//! The frontend list is consumed strictly in order (a single positional
+//! cursor). The llm and tool lists are matched by *content*: each
+//! [`SharedScript::next_llm`] picks the first unconsumed turn whose
+//! `expect_user_contains` matches the request, and each
+//! [`SharedScript::next_tool`] picks the first unconsumed entry whose
+//! `expect_name` (and `expect_input` subset) matches the call. A single
+//! agent still consumes these lists in their written order, because each
+//! entry matches the call that comes next. Concurrent subagents share the
+//! one llm and tool list, and content addressing keeps the replay
+//! deterministic when those agents race: a turn is delivered to the agent
+//! whose request matches it, not to whichever agent happened to ask first.
+//! Exact event order across parallel children is still not guaranteed —
+//! assert on the set of per-agent outcomes, not on a fixed interleaving.
 
 use std::sync::{Arc, Mutex};
 
@@ -118,15 +130,24 @@ pub fn json_subset_matches(expected: &serde_json::Value, actual: &serde_json::Va
 
 struct ScriptState {
     script: TestScript,
-    llm_cursor: usize,
-    tool_cursor: usize,
+    /// One flag per `script.llm` entry: true once that turn has been
+    /// returned by `next_llm`. Concurrent subagents share the one llm list,
+    /// so turns are matched by content (see `next_llm`) rather than by a
+    /// single forward position, and a separate flag per entry records which
+    /// have been consumed.
+    llm_consumed: Vec<bool>,
+    /// One flag per `script.tools` entry, consumed by content like the llm
+    /// turns above.
+    tool_consumed: Vec<bool>,
     frontend_cursor: usize,
     /// Events observed so far, for ExpectEvent checks.
     events_seen: Vec<Event>,
 }
 
 /// One script shared by all mock components in a session. Each component
-/// consumes its own list in order; cursors are independent.
+/// consumes its own list; the frontend list is positional, while the llm
+/// and tool lists are content-addressed so concurrent subagents racing on
+/// the shared script stay deterministic.
 #[derive(Clone)]
 pub struct SharedScript {
     state: Arc<Mutex<ScriptState>>,
@@ -134,72 +155,126 @@ pub struct SharedScript {
 
 impl SharedScript {
     pub fn new(script: TestScript) -> Self {
+        let llm_consumed = vec![false; script.llm.len()];
+        let tool_consumed = vec![false; script.tools.len()];
         SharedScript {
             state: Arc::new(Mutex::new(ScriptState {
                 script,
-                llm_cursor: 0,
-                tool_cursor: 0,
+                llm_consumed,
+                tool_consumed,
                 frontend_cursor: 0,
                 events_seen: Vec::new(),
             })),
         }
     }
 
-    /// Consumes the next scripted LLM turn, validating expectations against
-    /// the actual request.
+    /// Consumes one scripted LLM turn, matched by content against the
+    /// request. Among the still-unconsumed turns, the first whose
+    /// `expect_user_contains` matches the request's last user text is
+    /// chosen; if no unconsumed turn carries an expectation, the first
+    /// unconsumed turn is chosen positionally (this is the single-agent
+    /// case, where turns are consumed in order). A turn whose expectation
+    /// matches nothing pending is left unconsumed, so a genuine mismatch
+    /// still surfaces.
     pub fn next_llm(&self, request: &CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let mut state = self.state.lock().expect("script state poisoned");
-        let cursor = state.llm_cursor;
-        let turn = state
+        if state.llm_consumed.iter().all(|done| *done) {
+            return Err(LlmError::ScriptMismatch("llm script exhausted".into()));
+        }
+        let last_user_text = request
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.text())
+            .unwrap_or_default();
+        let chosen = state
             .script
             .llm
-            .get(cursor)
-            .cloned()
-            .ok_or_else(|| LlmError::ScriptMismatch("llm script exhausted".into()))?;
-        if let Some(expected) = &turn.expect_user_contains {
-            let last_user_text = request
-                .messages
+            .iter()
+            .enumerate()
+            .find(|(index, turn)| {
+                !state.llm_consumed[*index]
+                    && turn
+                        .expect_user_contains
+                        .as_ref()
+                        .is_some_and(|needle| last_user_text.contains(needle.as_str()))
+            })
+            .map(|(index, _)| index)
+            .or_else(|| {
+                // No unconsumed turn carries an expectation that matches;
+                // fall back to the first unconsumed turn only when it has
+                // no expectation, so an unmet expectation is a mismatch
+                // rather than silently satisfied.
+                state
+                    .script
+                    .llm
+                    .iter()
+                    .enumerate()
+                    .find(|(index, _)| !state.llm_consumed[*index])
+                    .filter(|(_, turn)| turn.expect_user_contains.is_none())
+                    .map(|(index, _)| index)
+            });
+        let index = chosen.ok_or_else(|| {
+            // Every unconsumed turn carries an expectation, and none matched.
+            let expected: Vec<&str> = state
+                .script
+                .llm
                 .iter()
-                .rev()
-                .find(|m| m.role == Role::User)
-                .map(|m| m.text())
-                .unwrap_or_default();
-            if !last_user_text.contains(expected.as_str()) {
-                return Err(LlmError::ScriptMismatch(format!(
-                    "llm turn {cursor}: expected user message containing {expected:?}, got {last_user_text:?}"
-                )));
-            }
-        }
-        state.llm_cursor += 1;
-        Ok(turn.response)
+                .enumerate()
+                .filter(|(index, _)| !state.llm_consumed[*index])
+                .filter_map(|(_, turn)| turn.expect_user_contains.as_deref())
+                .collect();
+            LlmError::ScriptMismatch(format!(
+                "no unconsumed llm turn matches the request; \
+                 expected one of {expected:?}, got {last_user_text:?}"
+            ))
+        })?;
+        state.llm_consumed[index] = true;
+        Ok(state.script.llm[index].response.clone())
     }
 
-    /// Consumes the next scripted tool execution, validating the call.
+    /// Consumes one scripted tool execution, matched by content against the
+    /// call. Among the still-unconsumed entries, the first whose
+    /// `expect_name` matches (and whose `expect_input` subset matches, when
+    /// present) is chosen; entries are consumed in order in the
+    /// single-agent case, where each matches in turn.
     pub fn next_tool(&self, call: &ToolCall) -> Result<ToolOutput, SandboxError> {
         let mut state = self.state.lock().expect("script state poisoned");
-        let cursor = state.tool_cursor;
-        let scripted = state
+        if state.tool_consumed.iter().all(|done| *done) {
+            return Err(SandboxError::ScriptMismatch("tool script exhausted".into()));
+        }
+        let chosen = state
             .script
             .tools
-            .get(cursor)
-            .cloned()
-            .ok_or_else(|| SandboxError::ScriptMismatch("tool script exhausted".into()))?;
-        if scripted.expect_name != call.name {
-            return Err(SandboxError::ScriptMismatch(format!(
-                "tool exec {cursor}: expected tool {:?}, got {:?}",
-                scripted.expect_name, call.name
-            )));
-        }
-        if let Some(expected_input) = &scripted.expect_input {
-            if !json_subset_matches(expected_input, &call.input) {
-                return Err(SandboxError::ScriptMismatch(format!(
-                    "tool exec {cursor} ({}): input {} does not match expectation {}",
-                    call.name, call.input, expected_input
-                )));
-            }
-        }
-        state.tool_cursor += 1;
-        Ok(scripted.output)
+            .iter()
+            .enumerate()
+            .find(|(index, scripted)| {
+                !state.tool_consumed[*index]
+                    && scripted.expect_name == call.name
+                    && scripted
+                        .expect_input
+                        .as_ref()
+                        .is_none_or(|expected| json_subset_matches(expected, &call.input))
+            })
+            .map(|(index, _)| index);
+        let index = chosen.ok_or_else(|| {
+            let expected: Vec<&str> = state
+                .script
+                .tools
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !state.tool_consumed[*index])
+                .map(|(_, scripted)| scripted.expect_name.as_str())
+                .collect();
+            SandboxError::ScriptMismatch(format!(
+                "no unconsumed tool exec matches {:?} with input {}; \
+                 expected one of {expected:?}",
+                call.name, call.input
+            ))
+        })?;
+        state.tool_consumed[index] = true;
+        Ok(state.script.tools[index].output.clone())
     }
 
     /// Consumes the next frontend step, if any.
@@ -220,7 +295,7 @@ impl SharedScript {
     /// Number of scripted tool executions consumed so far.
     pub fn tools_consumed(&self) -> usize {
         let state = self.state.lock().expect("script state poisoned");
-        state.tool_cursor
+        state.tool_consumed.iter().filter(|done| **done).count()
     }
 
     /// Records an observed event for later ExpectEvent checks.
@@ -248,19 +323,23 @@ impl SharedScript {
     /// True when every scripted item has been consumed.
     pub fn finished(&self) -> bool {
         let state = self.state.lock().expect("script state poisoned");
-        state.llm_cursor >= state.script.llm.len()
-            && state.tool_cursor >= state.script.tools.len()
+        state.llm_consumed.iter().all(|done| *done)
+            && state.tool_consumed.iter().all(|done| *done)
             && state.frontend_cursor >= state.script.frontend.len()
     }
 
-    /// Describes unconsumed script items, for test failure messages.
+    /// Describes unconsumed script items, for test failure messages. The
+    /// llm and tool counts are how many entries have been consumed across
+    /// the whole list (matching by content, so not necessarily a prefix).
     pub fn remaining_summary(&self) -> String {
         let state = self.state.lock().expect("script state poisoned");
+        let llm_done = state.llm_consumed.iter().filter(|done| **done).count();
+        let tool_done = state.tool_consumed.iter().filter(|done| **done).count();
         format!(
             "llm {}/{}, tools {}/{}, frontend {}/{}",
-            state.llm_cursor,
+            llm_done,
             state.script.llm.len(),
-            state.tool_cursor,
+            tool_done,
             state.script.tools.len(),
             state.frontend_cursor,
             state.script.frontend.len()

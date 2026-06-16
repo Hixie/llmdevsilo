@@ -3,10 +3,9 @@
 //! frontend requests shutdown or a signal arrives.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot};
 
 use silo_core::clock::{FakeClock, RealClock, SharedClock};
 use silo_core::config::{HarnessConfig, SandboxKind};
@@ -151,7 +150,7 @@ pub async fn run(
                 &journal,
                 None,
                 None,
-                Some(proxy),
+                Some(proxy.as_mut()),
                 Some(attached),
                 None,
             )
@@ -177,7 +176,7 @@ pub async fn run(
                 &journal,
                 None,
                 None,
-                Some(proxy),
+                Some(proxy.as_mut()),
                 Some(attached),
                 None,
             )
@@ -191,8 +190,8 @@ pub async fn run(
             Some(&bus),
             &journal,
             None,
-            Some(sandbox),
-            Some(proxy),
+            Some(sandbox.as_mut()),
+            Some(proxy.as_mut()),
             Some(attached),
             None,
         )
@@ -219,8 +218,8 @@ pub async fn run(
                     Some(&bus),
                     &journal,
                     None,
-                    Some(sandbox),
-                    Some(proxy),
+                    Some(sandbox.as_mut()),
+                    Some(proxy.as_mut()),
                     Some(attached),
                     None,
                 )
@@ -247,9 +246,9 @@ pub async fn run(
         let _ = finish(
             Some(&bus),
             &journal,
-            Some(frontend),
-            Some(sandbox),
-            Some(proxy),
+            Some(frontend.as_mut()),
+            Some(sandbox.as_mut()),
+            Some(proxy.as_mut()),
             Some(attached),
             None,
         )
@@ -262,6 +261,7 @@ pub async fn run(
     registry.add_all(sandbox.tool_defs(), ToolOwner::Sandbox);
     registry.add_all(frontend.tool_defs(), ToolOwner::Frontend);
     registry.add(silo_llm::common::agent_tool_def(), ToolOwner::Harness);
+    registry.add(silo_llm::common::await_agent_tool_def(), ToolOwner::Harness);
     let tool_names: Vec<String> = registry
         .entries()
         .iter()
@@ -281,9 +281,9 @@ pub async fn run(
             let _ = finish(
                 Some(&bus),
                 &journal,
-                Some(frontend),
-                Some(sandbox),
-                Some(proxy),
+                Some(frontend.as_mut()),
+                Some(sandbox.as_mut()),
+                Some(proxy.as_mut()),
                 Some(attached),
                 None,
             )
@@ -305,24 +305,29 @@ pub async fn run(
         let _ = notify.send(());
     }
 
+    // Subagents run on background tasks that clone the session context, so
+    // the components they reach are shared through `Arc` for the session.
+    // The sandbox and frontend are moved out of their boxes into `Arc`s for
+    // the session and reclaimed afterwards: `drive` joins every background
+    // task before it returns, so once the session loop ends no task holds a
+    // clone and the `Arc` refcount is back to one.
+    let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
+    let frontend: Arc<dyn Frontend> = Arc::from(frontend);
+
     // Session: the top-level agent loop runs alongside the upload
     // listener; the listener never completes on its own.
     let session_result: Result<agent::SessionEnd, HarnessError> = {
-        let agent_counter = AtomicU64::new(1);
-        let subagent_slots = Semaphore::new(agent::MAX_CONCURRENT_SUBAGENTS);
-        let ctx = agent::SessionCtx {
-            bus: &bus,
-            journal: &journal,
-            backend: backend.as_ref(),
-            sandbox: sandbox.as_ref(),
-            frontend: frontend.as_ref(),
-            registry: &registry,
-            shutdown: &shutdown,
-            system: &system,
-            max_tokens: config.llm.max_tokens,
-            agent_counter: &agent_counter,
-            subagent_slots: &subagent_slots,
-        };
+        let ctx = agent::SessionCtx::new(
+            bus.clone(),
+            journal.clone(),
+            backend.clone(),
+            sandbox.clone(),
+            frontend.clone(),
+            Arc::new(registry),
+            shutdown.clone(),
+            Arc::from(system.as_str()),
+            config.llm.max_tokens,
+        );
         tokio::select! {
             result = agent::top_level_loop(&ctx) => result,
             () = uploads::listen(&bus, sandbox.as_ref(), &journal) => {
@@ -345,13 +350,13 @@ pub async fn run(
             } else {
                 end.message.clone()
             };
-            let finish_result = finish(
-                Some(&bus),
+            let finish_result = finish_shared(
+                &bus,
                 &journal,
-                Some(frontend),
-                Some(sandbox),
-                Some(proxy),
-                Some(attached),
+                frontend,
+                sandbox,
+                proxy.as_mut(),
+                attached,
                 final_message,
             )
             .await;
@@ -405,13 +410,13 @@ pub async fn run(
                 context: "harness".into(),
                 message: error.to_string(),
             });
-            let _ = finish(
-                Some(&bus),
+            let _ = finish_shared(
+                &bus,
                 &journal,
-                Some(frontend),
-                Some(sandbox),
-                Some(proxy),
-                Some(attached),
+                frontend,
+                sandbox,
+                proxy.as_mut(),
+                attached,
                 None,
             )
             .await;
@@ -420,15 +425,68 @@ pub async fn run(
     }
 }
 
+/// Post-session shutdown: reclaims exclusive access to the sandbox and
+/// frontend (every background task and the session context have been
+/// dropped by now, so each `Arc` holds the only reference) and runs the
+/// shared [`finish`] routine. The `Arc`s are owned here and dropped only
+/// after `finish` returns, so the `get_mut` borrows never overlap their
+/// `Drop`.
+async fn finish_shared(
+    bus: &EventBus,
+    journal: &JournalHandle,
+    frontend: Arc<dyn Frontend>,
+    sandbox: Arc<dyn Sandbox>,
+    proxy: &mut dyn EgressProxy,
+    attached: AttachedWorkspace,
+    message: Option<String>,
+) -> Result<(), HarnessError> {
+    // Hold the Arcs in `Option`s so they can be `take`n (and their `Drop`
+    // run) explicitly after the borrows are done, sidestepping the
+    // conservative interaction between `Arc`'s significant destructor and a
+    // `get_mut` borrow held across an await.
+    let mut frontend = Some(frontend);
+    let mut sandbox = Some(sandbox);
+    let frontend_mut = frontend
+        .as_mut()
+        .and_then(Arc::get_mut)
+        .map(|f| f as &mut dyn Frontend);
+    let sandbox_mut = sandbox
+        .as_mut()
+        .and_then(Arc::get_mut)
+        .map(|s| s as &mut dyn Sandbox);
+    if frontend_mut.is_none() || sandbox_mut.is_none() {
+        // A background task outlived the session loop, against the
+        // invariant that `drive` joins every child before returning.
+        tracing::error!("a subagent task outlived the session; shutdown may be incomplete");
+    }
+    let result = finish(
+        Some(bus),
+        journal,
+        frontend_mut,
+        sandbox_mut,
+        Some(proxy),
+        Some(attached),
+        message,
+    )
+    .await;
+    frontend.take();
+    sandbox.take();
+    result
+}
+
 /// Shuts down every started component, detaches the workspace, and writes
 /// the final journal entry. All steps run even when one fails; the first
-/// failure is returned.
+/// failure is returned. The components are passed by mutable reference, so
+/// the same routine serves both the setup error paths (which still own the
+/// boxed components) and the post-session path (where the sandbox and
+/// frontend are shared through `Arc` and reclaimed once every background
+/// task has finished).
 async fn finish(
     bus: Option<&EventBus>,
     journal: &JournalHandle,
-    mut frontend: Option<Box<dyn Frontend>>,
-    mut sandbox: Option<Box<dyn Sandbox>>,
-    mut proxy: Option<Box<dyn EgressProxy>>,
+    frontend: Option<&mut dyn Frontend>,
+    sandbox: Option<&mut dyn Sandbox>,
+    proxy: Option<&mut dyn EgressProxy>,
     attached: Option<AttachedWorkspace>,
     message: Option<String>,
 ) -> Result<(), HarnessError> {
@@ -438,19 +496,19 @@ async fn finish(
         });
     }
     let mut first_error: Option<HarnessError> = None;
-    if let Some(frontend) = frontend.as_mut() {
+    if let Some(frontend) = frontend {
         if let Err(error) = frontend.shutdown(message.clone()).await {
             tracing::warn!("frontend shutdown failed: {error}");
             first_error.get_or_insert(error.into());
         }
     }
-    if let Some(sandbox) = sandbox.as_mut() {
+    if let Some(sandbox) = sandbox {
         if let Err(error) = sandbox.shutdown().await {
             tracing::warn!("sandbox shutdown failed: {error}");
             first_error.get_or_insert(error.into());
         }
     }
-    if let Some(proxy) = proxy.as_mut() {
+    if let Some(proxy) = proxy {
         if let Err(error) = proxy.shutdown().await {
             tracing::warn!("proxy shutdown failed: {error}");
             first_error.get_or_insert(error.into());

@@ -74,7 +74,7 @@ To also use the command-line tools from a terminal, double-click
 (asking for your administrator password). The same pages are in the
 man/ folder on this image.
 
-Documentation: https://github.com/ianh/llmdevsilo
+Documentation: https://github.com/Hixie/llmdevsilo
 EOF
 
 # --- The command-line tools installer. --------------------------------------

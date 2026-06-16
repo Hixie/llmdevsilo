@@ -77,6 +77,112 @@ fn payloads(events: &[silo_core::event::Event]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// A single-child subagent session: spawn one subagent, await it, exit.
+/// Kept to one child so completion order is fixed and exact event-order
+/// equality holds on replay (concurrent children do not guarantee a fixed
+/// interleaving).
+fn single_subagent_script() -> TestScript {
+    TestScript {
+        name: "replay_subagent".into(),
+        llm: vec![
+            common::llm_turn(
+                Some("delegate"),
+                Some("Spawning."),
+                &[(
+                    "t1",
+                    "Agent",
+                    json!({"prompt": "child work", "name": "child"}),
+                )],
+                StopReason::ToolUse,
+                TokenDelta {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                },
+            ),
+            common::llm_turn(
+                Some("runs in the background"),
+                Some("Awaiting."),
+                &[("t2", "AwaitAgent", json!({}))],
+                StopReason::ToolUse,
+                TokenDelta {
+                    input_tokens: 8,
+                    output_tokens: 3,
+                },
+            ),
+            common::llm_turn(
+                Some("child work"),
+                Some("child result"),
+                &[],
+                StopReason::EndTurn,
+                TokenDelta {
+                    input_tokens: 6,
+                    output_tokens: 4,
+                },
+            ),
+            common::llm_turn(
+                Some("child result"),
+                Some("Done."),
+                &[("t3", "Exit", json!({"message": "done: delegated"}))],
+                StopReason::ToolUse,
+                TokenDelta {
+                    input_tokens: 20,
+                    output_tokens: 7,
+                },
+            ),
+        ],
+        tools: vec![],
+        frontend: vec![
+            FrontendStep::SendPrompt {
+                text: "delegate".into(),
+            },
+            FrontendStep::ExpectShutdown {
+                message_contains: Some("done".into()),
+            },
+        ],
+        network: vec![],
+    }
+}
+
+#[tokio::test]
+async fn replayed_single_subagent_session_matches_the_recording() {
+    let mut fixture = common::Fixture::new();
+    let config = fixture.config();
+
+    let script_a = common::shared(single_subagent_script());
+    let outcome_a = silo_harness::run(config.clone(), fixture.options(script_a.clone()))
+        .await
+        .expect("session A completes");
+    assert!(
+        script_a.finished(),
+        "remaining: {}",
+        script_a.remaining_summary()
+    );
+    let records_a = fixture.records();
+    let events_a = fixture.events();
+
+    let generated = script_from_journal(&records_a, "generated");
+    // The two subagent-control tools are harness-owned, so they do not
+    // appear under `tools`; the subagent's own model turn does appear under
+    // `llm`.
+    assert_eq!(generated.llm.len(), 4);
+    assert_eq!(generated.tools.len(), 0);
+
+    fixture.reset_journal();
+    let script_b = common::shared(generated);
+    let outcome_b = silo_harness::run(config, fixture.options(script_b.clone()))
+        .await
+        .expect("session B completes");
+    assert!(
+        script_b.finished(),
+        "remaining: {}",
+        script_b.remaining_summary()
+    );
+    let events_b = fixture.events();
+
+    assert_eq!(outcome_a.message, outcome_b.message);
+    assert_eq!(payloads(&events_a), payloads(&events_b));
+}
+
 #[tokio::test]
 async fn replayed_session_matches_the_recording() {
     let mut fixture = common::Fixture::new();

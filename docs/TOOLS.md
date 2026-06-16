@@ -1,8 +1,8 @@
 # Tools
 
 This document is the reference for every tool the model can call in a
-harness session. The source of truth is the code; this document describes
-what the code does today. The tool definitions live in
+harness session. The source of truth is the code. The tool definitions
+live in
 [`crates/silo-sandbox/src/tools.rs`](../crates/silo-sandbox/src/tools.rs)
 (the six sandbox tools),
 [`crates/silo-llm/src/common.rs`](../crates/silo-llm/src/common.rs)
@@ -29,8 +29,8 @@ Related documents, not duplicated here:
 
 ## 1. Overview
 
-Ten tools exist. Each is owned by one component, and the harness routes
-every call to its owner (`ToolRegistry` in
+Eleven tools exist. Each is owned by one component, and the harness
+routes every call to its owner (`ToolRegistry` in
 [`crates/silo-core/src/tool.rs`](../crates/silo-core/src/tool.rs)).
 
 | Tool | Owner | Available to | Contributed by |
@@ -42,15 +42,16 @@ every call to its owner (`ToolRegistry` in
 | `WebFetch` | sandbox | top-level agent and subagents | the sandbox module, always |
 | `WebSearch` | sandbox | top-level agent and subagents | the sandbox module, always |
 | `Agent` | harness | top-level agent and subagents | the LLM backend layer, always |
+| `AwaitAgent` | harness | top-level agent and subagents | the LLM backend layer, always |
 | `AskUserQuestion` | frontend | top-level agent only | the interactive frontend |
 | `SendUserFile` | frontend | top-level agent only | the interactive frontend |
 | `Exit` | frontend | top-level agent only | the headless frontend |
 
-A session therefore never offers all ten at once: an interactive session
-has no `Exit`, and a headless session has no `AskUserQuestion` or
+A session therefore never offers all eleven at once: an interactive
+session has no `Exit`, and a headless session has no `AskUserQuestion` or
 `SendUserFile`. (The mock frontend used by scripted tests contributes all
-three frontend tools.) Subagents get only the sandbox tools and `Agent`;
-the user-facing tools are withheld from them by design (see
+three frontend tools.) Subagents get the sandbox tools plus `Agent` and
+`AwaitAgent`; the user-facing tools are withheld from them by design (see
 [SUBAGENTS.md](SUBAGENTS.md)).
 
 ## 2. Common behavior
@@ -460,11 +461,18 @@ Result:
    Learn Rust with the "book".
 ```
 
-## 4. Agent
+## 4. Agent and AwaitAgent
 
-Launches a subagent to handle a self-contained task. The harness itself
-executes this tool; [SUBAGENTS.md](SUBAGENTS.md) covers the lifecycle,
-events, journaling, and prompt-writing advice in full.
+These two harness-owned tools delegate work to subagents. `Agent`
+launches one and returns at once; `AwaitAgent` collects a finished one.
+[SUBAGENTS.md](SUBAGENTS.md) covers the lifecycle, events, journaling,
+and prompt-writing advice in full.
+
+### 4.1 Agent
+
+Launches a subagent to handle a self-contained task. The call is
+non-blocking: it returns immediately with the new subagent's id, and the
+subagent runs in the background.
 
 **Availability:** top-level agent and subagents (so subagents can spawn
 their own subagents, within the depth limit).
@@ -474,30 +482,31 @@ their own subagents, within the depth limit).
 | `prompt` | string | yes | — | Complete, self-contained task description. Must be non-empty. |
 | `name` | string | no | — | Short display name. Used only by clients and journals; the subagent never sees it. |
 
-**Behavior.** The harness starts a fresh conversation with the same
-model, seeded with `prompt` as its only user message, and runs it until
-the model stops calling tools. The subagent shares the parent's sandbox,
-workspace, network policy, and usage meter, but not its conversation; it
-gets the sandbox tools and `Agent`, and none of the user-facing tools.
-The parent waits inline — tool calls within one model response run
-sequentially — and receives the subagent's final message text as this
-tool's result.
+**Behavior.** The harness assigns the subagent the next agent id, emits
+`agent_spawned`, starts a fresh conversation with the same model (seeded
+with `prompt` as its only user message) on a background task, and
+returns at once. The subagent shares the parent's sandbox, workspace,
+network policy, and usage meter, but not its conversation; it gets the
+sandbox tools plus `Agent` and `AwaitAgent`, and none of the user-facing
+tools. The subagent runs concurrently with the parent and any siblings.
+The parent collects it later with `AwaitAgent`.
 
-**Output.** On success, the subagent's final text as a success result.
-Error results:
+**Output.** On success, the message
+`Started subagent '<name>' (<id>). It runs in the background; collect it
+with AwaitAgent. Pass agent "<id>" to wait for this one.`, where `<id>`
+is the new subagent's agent id. Error results (the launch is refused
+without blocking; the session continues):
 
 - `Agent requires a non-empty 'prompt' string` — missing or empty
   prompt;
 - `subagent depth limit (3) reached` — the top-level agent is depth 0,
   and each spawn adds one;
-- `subagent concurrency limit (8) reached` — more than eight live
-  subagents;
-- the failure message itself, when the subagent's model request failed.
+- `subagent concurrency limit (8) reached` — eight subagents are already
+  live across the session.
 
 **Limits.** Depth 3 and concurrency 8, both returned as error results so
-the session continues. A user interrupt mid-subagent unwinds the whole
-agent tree; the parent's `Agent` call is recorded with the synthetic
-result `[interrupted by the user]`.
+the session continues. A subagent counts against the concurrency pool
+from launch until it is collected or cancelled.
 
 **Example.**
 
@@ -510,6 +519,59 @@ Input:
 Result:
 
 ```
+Started subagent 'test survey' (agent-1). It runs in the background; collect it with AwaitAgent. Pass agent "agent-1" to wait for this one.
+```
+
+### 4.2 AwaitAgent
+
+Waits for a subagent launched with `Agent` to finish and returns its
+report.
+
+**Availability:** top-level agent and subagents.
+
+| Field | Type | Required | Default | Constraints |
+| --- | --- | --- | --- | --- |
+| `agent` | string | no | — | Id of a specific subagent to wait for, as returned by `Agent`. Omit to wait for the first of the calling agent's still-running subagents to finish. |
+
+**Behavior.** With no `agent`, the call blocks until the first of the
+calling agent's outstanding subagents finishes (any of them). With an
+`agent` id, it waits for that specific subagent. Either way it collects
+exactly one subagent, removes it from the calling agent's set, and frees
+its concurrency slot. A subagent belongs only to the agent that spawned
+it, so one agent cannot await another's children. The call selects
+against the interrupt and shutdown signals, so an interrupt or shutdown
+unblocks it rather than letting it hang. The `agent_completed` event for
+the collected subagent is emitted by the subagent's own task when it
+finishes, which can be before or after this call.
+
+**Output.** On success, a heading line
+`Subagent '<name>' (<id>) finished.` followed by the subagent's final
+text. When the subagent's own outcome was an error (its model request
+failed, it was interrupted, or the session shut down mid-run), the same
+shape is returned as an error result carrying the subagent's error
+output. Error results from `AwaitAgent` itself:
+
+- `AwaitAgent: no subagents are running` — an await with no `agent` and
+  no outstanding subagents;
+- `AwaitAgent: "<id>" is not an outstanding subagent of this agent` — an
+  `agent` id this agent did not spawn, or already collected.
+
+**Limits.** Collects one subagent per call. An uncollected subagent is
+cancelled when the calling agent's turn ends (see "Orphan cancellation"
+in [SUBAGENTS.md](SUBAGENTS.md)).
+
+**Example.**
+
+Input:
+
+```json
+{}
+```
+
+Result:
+
+```
+Subagent 'test survey' (agent-1) finished.
 There are 3 test files.
 ```
 
@@ -689,7 +751,8 @@ section 2, and the egress proxy that `WebFetch`, `WebSearch`, and
 | `Bash` | `sandbox` | silo-helper, inside the sandbox (spawns `sh -c`) |
 | `WebFetch` | `sandbox` | silo-helper, through the egress proxy |
 | `WebSearch` | `sandbox` | silo-helper, through the egress proxy |
-| `Agent` | `harness` | the harness agent loop (spawns a subagent; see [SUBAGENTS.md](SUBAGENTS.md)) |
+| `Agent` | `harness` | the harness agent loop (launches a background subagent; see [SUBAGENTS.md](SUBAGENTS.md)) |
+| `AwaitAgent` | `harness` | the harness agent loop (collects a finished subagent; see [SUBAGENTS.md](SUBAGENTS.md)) |
 | `AskUserQuestion` | `frontend` | the interactive frontend, answered by a connected client |
 | `SendUserFile` | `frontend` | the interactive frontend, after the harness reads the file via the sandbox |
 | `Exit` | `frontend` | the headless frontend (requests session shutdown) |

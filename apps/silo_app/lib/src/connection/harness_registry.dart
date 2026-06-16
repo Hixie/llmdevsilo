@@ -123,10 +123,10 @@ class HarnessRegistry extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// One-time move from the legacy layout (one keystore item per key) to
-  /// the consolidated stores. Best-effort throughout: a denied keystore
-  /// read skips that value and the migration still completes, so the app
-  /// never gets stuck re-prompting.
+  /// Consolidates values stored one keystore item per key into the
+  /// single-document stores. Best-effort throughout: a denied keystore
+  /// read skips that value and the consolidation still completes, so the
+  /// app never gets stuck re-prompting.
   Future<void> _migrateLegacyStorage() async {
     final legacy = _legacySecrets;
     if (legacy != null &&

@@ -10,14 +10,18 @@ use silo_core::tool::{ToolAvailability, ToolDef};
 
 /// The Agent tool, contributed by the LLM backend layer per the design:
 /// any agent can spawn a subagent that shares the same sandbox. The
-/// harness executes this tool.
+/// harness executes this tool. The call returns immediately with the new
+/// subagent's id; the subagent runs in the background and is collected
+/// with [`await_agent_tool_def`].
 pub fn agent_tool_def() -> ToolDef {
     ToolDef {
         name: "Agent".to_string(),
         description: "Launch a subagent to handle a self-contained task. The subagent runs \
                       in the same sandbox and workspace, receives the prompt as its task \
-                      description, works autonomously (it cannot ask the user questions), \
-                      and returns its final report as this tool's result."
+                      description, and works autonomously (it cannot ask the user questions). \
+                      This call returns immediately with the subagent's id; the subagent runs \
+                      in the background. Collect its final report with AwaitAgent. Launch \
+                      several subagents, then await them, to run work in parallel."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -32,6 +36,33 @@ pub fn agent_tool_def() -> ToolDef {
                 }
             },
             "required": ["prompt"]
+        }),
+        availability: ToolAvailability::Both,
+    }
+}
+
+/// The AwaitAgent tool, contributed by the LLM backend layer alongside
+/// [`agent_tool_def`]. The harness executes it: it blocks until one of the
+/// calling agent's subagents finishes and returns that subagent's report.
+pub fn await_agent_tool_def() -> ToolDef {
+    ToolDef {
+        name: "AwaitAgent".to_string(),
+        description: "Wait for a subagent launched with Agent to finish and collect its final \
+                      report. With no input, waits for the first of your still-running \
+                      subagents to finish. With an 'agent' id, waits for that specific \
+                      subagent. Returns the subagent's id, display name, and final report (or \
+                      its error output if it failed). Each subagent is collected once."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "Optional id of a specific subagent to wait for, as returned \
+                                    by the Agent tool. Omit to wait for the first of your \
+                                    running subagents to finish."
+                }
+            }
         }),
         availability: ToolAvailability::Both,
     }

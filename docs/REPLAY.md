@@ -135,8 +135,16 @@ A script is one JSON object (the `TestScript` type in
 }
 ```
 
-All four lists default to empty and each is consumed strictly in order
-by the corresponding mock component. `name` is informational.
+All four lists default to empty. The `frontend` list is consumed
+strictly in order. The `llm` and `tools` lists are matched by *content*:
+each request or call is answered by the first still-unconsumed entry
+whose expectation matches it (see each list below). A single agent
+consumes these two lists in their written order anyway, because each
+entry matches the request that comes next. Content matching matters only
+when concurrent subagents share the one script and race; it keeps the
+replay deterministic by delivering a turn to the agent whose request
+matches it, not to whichever agent happened to ask first. `name` is
+informational.
 
 ### `llm` — scripted model turns
 
@@ -158,13 +166,23 @@ Each entry answers one completion request:
 ```
 
 - `expect_user_contains` (optional): the text of the most recent user
-  message in the request must contain this substring, or the mock
-  backend reports a mismatch. For matching purposes, tool-result
-  content in the request is treated as text — so after a tool call,
-  the next turn's expectation can match the tool's output (the worked
-  example below matches `"src"`, the scripted output of its Bash
-  call). Generated scripts leave this unset; set it in directly authored
-  scripts to pin down what the "model" is responding to.
+  message in the request must contain this substring. For matching
+  purposes, tool-result content in the request is treated as text — so
+  after a tool call, the next turn's expectation can match the tool's
+  output (the worked example below matches `"src"`, the scripted output
+  of its Bash call). Generated scripts leave this unset; set it in
+  directly authored scripts to pin down what the "model" is responding
+  to.
+
+  Matching picks the first unconsumed turn whose `expect_user_contains`
+  is present and matches the request. When no unconsumed turn carries an
+  expectation, the first unconsumed turn is used (the positional,
+  single-agent case). A turn whose expectation matches nothing in the
+  request is left unconsumed, so a genuine mismatch still surfaces: a
+  request that matches no unconsumed expectation, while expectation-
+  bearing turns remain, is reported as a script mismatch. For a script
+  with concurrent subagents, give every turn an `expect_user_contains`
+  so each is delivered to the right agent.
 - `response.content`: a list of blocks, each `{"type": "text", ...}`
   or `{"type": "tool_use", "id": ..., "name": ..., "input": ...}`.
   Tool-use ids are echoed back in tool results and should be unique
@@ -178,8 +196,12 @@ Each entry answers one completion request:
 Tool names the harness routes (anything else gets an "unknown tool"
 error result): `Read`, `Write`, `Edit`, `Bash`, `WebFetch`,
 `WebSearch` (sandbox); `AskUserQuestion`, `SendUserFile`, `Exit`
-(frontend); `Agent` (harness — spawns a subagent whose conversation
-consumes further `llm` turns from this same list).
+(frontend); `Agent` and `AwaitAgent` (harness). `Agent` spawns a
+subagent that runs in the background; its conversation consumes further
+`llm` turns from this same list, matched by content. `AwaitAgent`
+collects a finished subagent. Each subagent runs concurrently with its
+parent, so keep each turn keyed by `expect_user_contains` when more than
+one subagent runs at a time.
 
 ### `tools` — scripted sandbox executions
 
@@ -202,9 +224,16 @@ Each entry answers one sandbox-owned tool call:
 - `output`: played back as the tool result; `is_error: true` produces
   an error result.
 
-Only sandbox-owned tools consume entries from this list. Frontend
-tools (`AskUserQuestion`, `Exit`, `SendUserFile`) and the `Agent` tool
-do not.
+A call is answered by the first unconsumed entry whose `expect_name`
+matches (and whose `expect_input` subset matches, when present). With a
+single agent this is the next entry in order, because each matches its
+call in turn; the content match only matters when concurrent subagents
+issue tool calls that race on the shared list. A call that no unconsumed
+entry matches is a script mismatch.
+
+Only sandbox-owned tools consume entries from this list. Frontend tools
+(`AskUserQuestion`, `Exit`, `SendUserFile`) and the harness-owned
+`Agent` and `AwaitAgent` tools do not.
 
 ### `frontend` — scripted user behavior
 
@@ -233,20 +262,23 @@ lists are the ones that drive and check a replay.
 
 ## 4. How a replay runs
 
-All mock components share one script and consume their own list
-through an independent cursor — one for `llm`, one for `tools`, one
-for `frontend`. Sequencing is by script position and event sequence
-numbers only; nothing waits on a timer, so replays cannot race. Under
+All mock components share one script. The mock frontend consumes its
+list through a single position cursor; the mock LLM backend and the mock
+sandbox match their lists by content (the first unconsumed entry whose
+expectation matches), which keeps replays of concurrent subagents
+deterministic. Nothing waits on a timer, so replays cannot race. Under
 `--deterministic` the harness also uses a fake clock (no wall-clock
 timestamps) and disables operating-system signal handling.
 
 - The **mock LLM backend** answers each completion request with the
-  next `llm` turn, after checking the session quota and the turn's
-  `expect_user_contains`. Usage is metered, so quota flags and cost
+  first unconsumed `llm` turn whose `expect_user_contains` matches (or
+  the first unconsumed turn when none carries an expectation), after
+  checking the session quota. Usage is metered, so quota flags and cost
   reports behave as in a real session.
 - The **mock sandbox** executes nothing. Each sandbox tool call is
-  checked against the next `tools` entry (name, then input subset) and
-  the recorded output is played back.
+  answered by the first unconsumed `tools` entry whose `expect_name`
+  (and `expect_input` subset, when present) matches, and the recorded
+  output is played back.
 - The **mock frontend** supplies the next `frontend` step whenever the
   harness asks for input, answers a question, or shuts down, with the
   per-step behavior in the table above.
@@ -415,11 +447,18 @@ silo workspace unlock /tmp/replay-demo/ws
   `harness_started` event. To remove that difference too, pin
   `harness_id` in a `--config` TOML file (see the `--config` flag in
   [CLI.md](CLI.md)); the journals are then byte-for-byte identical.
-- **Sessions with concurrent subagents** consume `llm` turns from one
-  shared list in whatever order the agents reach the backend. Replays
-  of mock-recorded sessions are ordered by construction; a journal
-  recorded from a real session whose subagents genuinely raced may
-  need its turn order untangled before it replays cleanly.
+- **Sessions with concurrent subagents** are matched by content, not by
+  position: the mock LLM and sandbox deliver each scripted turn or tool
+  execution to the agent whose request matches its `expect_user_contains`
+  / `expect_name`, so a replay stays deterministic even though the
+  parent and its subagents run in parallel and reach the backend in no
+  fixed order. Two caveats. Give every turn in such a script an
+  `expect_user_contains`, since an expectation-free turn is matched
+  positionally and would be ambiguous across agents. And the *order* of
+  events across parallel children is still not guaranteed — assert on
+  the set of per-agent outcomes (which subagent produced which result),
+  not on a fixed interleaving. Single-child sessions (spawn one, await
+  it) keep an exact event order and round-trip byte-stably.
 
 ---
 

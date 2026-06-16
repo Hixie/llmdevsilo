@@ -79,9 +79,15 @@ impl ShutdownSignal {
         }
     }
 
-    /// Applies every queued frontend command.
+    /// Applies every queued frontend command. Acquires the command receiver
+    /// with `try_lock` so it never blocks behind a concurrent abort waiter
+    /// that is parked on the receiver; when that waiter holds the lock it is
+    /// already draining and applying commands into the watch channels, so
+    /// skipping here loses nothing.
     async fn drain(&self) {
-        let mut guard = self.commands.lock().await;
+        let Ok(mut guard) = self.commands.try_lock() else {
+            return;
+        };
         let mut disconnected = false;
         if let Some(rx) = guard.as_mut() {
             loop {
@@ -124,6 +130,14 @@ impl ShutdownSignal {
     /// Waits until in-progress work should stop: a shutdown request, or an
     /// interrupt newer than `generation`. Drains frontend commands while
     /// waiting; a shutdown wins over a co-queued interrupt.
+    ///
+    /// Several abort waiters can run at once (the top-level agent and its
+    /// background subagents each have one in flight). Only one of them holds
+    /// the single command receiver at a time: it is acquired with `try_lock`
+    /// and, when another waiter already holds it, this one watches only the
+    /// shutdown and interrupt channels. The holder applies each command into
+    /// those channels, which wakes every waiter — so no waiter blocks behind
+    /// another on the receiver lock.
     pub async fn wait_abort(&self, generation: u64) -> AbortReason {
         let mut state_rx = self.state.subscribe();
         let mut interrupt_rx = self.interrupts.subscribe();
@@ -135,50 +149,74 @@ impl ShutdownSignal {
             if *interrupt_rx.borrow_and_update() > generation {
                 return AbortReason::Interrupted;
             }
-            let mut guard = self.commands.lock().await;
-            if let Some(rx) = guard.as_mut() {
-                tokio::select! {
-                    _ = state_rx.changed() => {}
-                    _ = interrupt_rx.changed() => {}
-                    command = rx.recv() => match command {
-                        Some(command) => self.apply(command),
-                        None => *guard = None,
+            match self.commands.try_lock() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(rx) => {
+                        tokio::select! {
+                            _ = state_rx.changed() => {}
+                            _ = interrupt_rx.changed() => {}
+                            command = rx.recv() => match command {
+                                Some(command) => self.apply(command),
+                                None => *guard = None,
+                            }
+                        }
                     }
-                }
-            } else {
-                drop(guard);
-                tokio::select! {
-                    _ = state_rx.changed() => {}
-                    _ = interrupt_rx.changed() => {}
+                    None => {
+                        drop(guard);
+                        tokio::select! {
+                            _ = state_rx.changed() => {}
+                            _ = interrupt_rx.changed() => {}
+                        }
+                    }
+                },
+                Err(_) => {
+                    // Another waiter holds the command receiver; it applies
+                    // commands into the watch channels, so waiting on those
+                    // is enough.
+                    tokio::select! {
+                        _ = state_rx.changed() => {}
+                        _ = interrupt_rx.changed() => {}
+                    }
                 }
             }
         }
     }
 
-    /// Waits until a shutdown is requested and returns its message.
+    /// Waits until a shutdown is requested and returns its message. Like
+    /// [`ShutdownSignal::wait_abort`], it acquires the command receiver with
+    /// `try_lock` so it never blocks behind a concurrent abort waiter.
     pub async fn wait(&self) -> Option<String> {
         let mut state_rx = self.state.subscribe();
         loop {
             if let Some(message) = state_rx.borrow_and_update().clone() {
                 return message;
             }
-            let mut guard = self.commands.lock().await;
-            if let Some(rx) = guard.as_mut() {
-                tokio::select! {
-                    changed = state_rx.changed() => {
-                        if changed.is_err() {
+            match self.commands.try_lock() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(rx) => {
+                        tokio::select! {
+                            changed = state_rx.changed() => {
+                                if changed.is_err() {
+                                    return None;
+                                }
+                            }
+                            command = rx.recv() => match command {
+                                Some(command) => self.apply(command),
+                                None => *guard = None,
+                            }
+                        }
+                    }
+                    None => {
+                        drop(guard);
+                        if state_rx.changed().await.is_err() {
                             return None;
                         }
                     }
-                    command = rx.recv() => match command {
-                        Some(command) => self.apply(command),
-                        None => *guard = None,
+                },
+                Err(_) => {
+                    if state_rx.changed().await.is_err() {
+                        return None;
                     }
-                }
-            } else {
-                drop(guard);
-                if state_rx.changed().await.is_err() {
-                    return None;
                 }
             }
         }

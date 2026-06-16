@@ -15,8 +15,8 @@ import 'dart:convert';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 /// String key/value store. Implementations back it with a JSON document
-/// ([JsonDocumentStore]) or, for the legacy layout, one keystore item per
-/// key ([SecureSecretStore]). Tests use [MemorySecretStore].
+/// ([JsonDocumentStore]) or with one keystore item per key
+/// ([SecureSecretStore]). Tests use [MemorySecretStore].
 abstract class SecretStore {
   Future<String?> read(String key);
   Future<void> write(String key, String value);
@@ -26,9 +26,10 @@ abstract class SecretStore {
 /// One key per platform-keystore item: Keychain on macOS/iOS, the Android
 /// keystore, and browser storage (encrypted with WebCrypto) on web.
 ///
-/// This is the legacy layout. The app reads it only to migrate old values
-/// into the consolidated stores; every item is its own keychain entry, so
-/// on macOS every read can raise its own permission prompt.
+/// The app reads this layout only to consolidate values stored
+/// one-per-item into the single-document stores; every item is its own
+/// keychain entry, so on macOS every read can raise its own permission
+/// prompt.
 class SecureSecretStore implements SecretStore {
   // The macOS data-protection keychain requires the keychain-access-groups
   // entitlement, which only builds under real development signing. The

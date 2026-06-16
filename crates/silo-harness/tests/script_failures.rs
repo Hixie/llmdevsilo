@@ -148,7 +148,13 @@ async fn a_sandbox_tool_name_mismatch_fails_the_session() {
         failure.contains("sandbox script mismatch"),
         "failure: {failure}"
     );
-    assert!(failure.contains("expected tool"), "failure: {failure}");
+    // The mock matches tool executions by content, so an unmatched call
+    // reports the names it could not be matched against.
+    assert!(
+        failure.contains("no unconsumed tool exec matches"),
+        "failure: {failure}"
+    );
+    assert!(failure.contains("\"Bash\""), "failure: {failure}");
     assert!(failure.contains("remaining:"), "failure: {failure}");
     assert!(outcome.llm_failure.is_none());
     assert!(outcome.message.is_none());

@@ -93,9 +93,9 @@ path, and the last launch form — lives in a plain JSON preferences file in
 the application support directory. One keychain item means at most one
 keychain prompt per run, and the item is read lazily: only when a flow
 actually needs a secret (connecting to an endpoint, pairing), never before
-the first frame is on screen. On first launch after upgrading, values left
-in the old layout (one keychain item per key) are migrated into the new
-one and the old items are deleted; the migration tolerates denied reads.
+the first frame is on screen. When secrets are found stored as one
+keychain item per key, they are consolidated into the single item and the
+separate items are removed; the consolidation tolerates denied reads.
 
 On macOS the app stores secrets in the legacy login keychain
 (`useDataProtectionKeyChain: false` in `lib/src/connection/secret_store.dart`).

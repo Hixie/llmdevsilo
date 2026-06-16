@@ -61,7 +61,7 @@ Maintainer: Ian Hickson <ian@hixie.ch>
 Depends: libc6
 Section: devel
 Priority: optional
-Homepage: https://github.com/ianh/llmdevsilo
+Homepage: https://github.com/Hixie/llmdevsilo
 Description: sandboxed LLM coding harness
  Runs LLM coding agents against locked workspaces inside a static
  sandbox, with all network egress through a filtering proxy. Ships the

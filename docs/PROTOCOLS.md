@@ -1,8 +1,8 @@
 # Protocols
 
 This document is the reference for every protocol spoken between processes
-in the llmdevsilo system. The source of truth is the code; this document
-describes what the code does today. The primary definitions live in
+in the llmdevsilo system. The source of truth is the code. The primary
+definitions live in
 [`crates/silo-core/src/protocol.rs`](../crates/silo-core/src/protocol.rs)
 (client protocol), [`crates/silo-core/src/event.rs`](../crates/silo-core/src/event.rs)
 (event stream), and [`crates/silo-core/src/helper.rs`](../crates/silo-core/src/helper.rs)

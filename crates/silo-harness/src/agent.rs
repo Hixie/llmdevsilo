@@ -1,10 +1,20 @@
 //! The agent loop: drives one conversation (top level or subagent)
 //! against the LLM backend and routes tool calls to their owners.
+//!
+//! Subagents run asynchronously. The Agent tool spawns a subagent's
+//! [`drive`] loop on a background task and returns at once with the new
+//! agent's id; the AwaitAgent tool collects a finished subagent's report.
+//! Each subagent is scoped to the turn of the agent that spawned it: when
+//! that agent's `drive` returns, any subagents it never collected are
+//! cancelled.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 
 use silo_core::conversation::{
     AgentId, AgentKind, CompletionRequest, CompletionResponse, ContentBlock, Message, Role,
@@ -24,21 +34,123 @@ const MAX_SUBAGENT_DEPTH: u32 = 3;
 /// Maximum number of concurrently running subagents.
 pub(crate) const MAX_CONCURRENT_SUBAGENTS: usize = 8;
 
-/// Borrowed view of every component an agent loop needs. Shared by the
-/// top-level agent and all subagents in a session.
-pub(crate) struct SessionCtx<'a> {
-    pub bus: &'a EventBus,
-    pub journal: &'a JournalHandle,
-    pub backend: &'a dyn LlmBackend,
-    pub sandbox: &'a dyn Sandbox,
-    pub frontend: &'a dyn Frontend,
-    pub registry: &'a ToolRegistry,
-    pub shutdown: &'a ShutdownSignal,
-    pub system: &'a str,
+/// Result a subagent's background task reports back to the collecting
+/// AwaitAgent call. The task emits its own `AgentCompleted` event (unless
+/// the parent cancels it first), so this only carries what the parent's
+/// tool result needs.
+struct ChildResult {
+    /// The subagent's final text, or its error/interrupt output.
+    output: String,
+    is_error: bool,
+    /// True when the subagent ended because a shutdown was requested; the
+    /// collecting AwaitAgent turns this into a Shutdown disposition.
+    shutdown: bool,
+    /// Set when the subagent ended on a mock script mismatch; the
+    /// collecting AwaitAgent turns this into a ScriptFailed disposition so
+    /// the session ends as a script failure, as in the single-agent flow.
+    script_failure: Option<String>,
+}
+
+/// One spawned-but-not-collected subagent, held by its parent's pool.
+struct ChildHandle {
+    name: Option<AgentId>,
+    join: JoinHandle<ChildResult>,
+    /// Released (returning the slot to `subagent_slots`) when the child is
+    /// collected or cancelled.
+    _permit: OwnedSemaphorePermit,
+    /// Swapped to true by whichever of the task or the cancellation path
+    /// reaches the child's terminal `AgentCompleted` first, so exactly one
+    /// such event is emitted per child.
+    emitted: Arc<AtomicBool>,
+}
+
+/// The subagents one agent has spawned and not yet collected, plus a
+/// channel each child task signals when it finishes (so an await-any call
+/// can learn which child to reap).
+struct ChildPool {
+    children: HashMap<AgentId, ChildHandle>,
+    done_tx: mpsc::UnboundedSender<AgentId>,
+    /// The receiving half, parked here between waits. An await-any call
+    /// takes it for the duration of its wait and returns it after.
+    done_rx: Option<mpsc::UnboundedReceiver<AgentId>>,
+}
+
+impl ChildPool {
+    fn new() -> ChildPool {
+        let (done_tx, done_rx) = mpsc::unbounded_channel();
+        ChildPool {
+            children: HashMap::new(),
+            done_tx,
+            done_rx: Some(done_rx),
+        }
+    }
+
+    fn done_rx_take(&mut self) -> mpsc::UnboundedReceiver<AgentId> {
+        self.done_rx
+            .take()
+            .expect("the done receiver is taken by at most one await at a time")
+    }
+
+    fn done_rx_put(&mut self, rx: mpsc::UnboundedReceiver<AgentId>) {
+        self.done_rx = Some(rx);
+    }
+}
+
+/// Per-session registry of every agent's outstanding children, keyed by
+/// parent agent id.
+type ChildRegistry = Arc<Mutex<HashMap<AgentId, ChildPool>>>;
+
+/// Shared, `'static` view of every component an agent loop needs. Cloned
+/// (cheaply, all fields are `Arc`-backed) into each subagent's background
+/// task. Shared by the top-level agent and all subagents in a session.
+#[derive(Clone)]
+pub(crate) struct SessionCtx {
+    pub bus: EventBus,
+    pub journal: JournalHandle,
+    pub backend: Arc<dyn LlmBackend>,
+    pub sandbox: Arc<dyn Sandbox>,
+    pub frontend: Arc<dyn Frontend>,
+    pub registry: Arc<ToolRegistry>,
+    pub shutdown: ShutdownSignal,
+    pub system: Arc<str>,
     pub max_tokens: u32,
     /// Next subagent number; the top-level agent is `agent-0`.
-    pub agent_counter: &'a AtomicU64,
-    pub subagent_slots: &'a Semaphore,
+    pub agent_counter: Arc<AtomicU64>,
+    pub subagent_slots: Arc<Semaphore>,
+    /// Each agent's spawned-but-uncollected children.
+    children: ChildRegistry,
+}
+
+impl SessionCtx {
+    /// Builds the session context from the components the harness owns for
+    /// the session.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        bus: EventBus,
+        journal: JournalHandle,
+        backend: Arc<dyn LlmBackend>,
+        sandbox: Arc<dyn Sandbox>,
+        frontend: Arc<dyn Frontend>,
+        registry: Arc<ToolRegistry>,
+        shutdown: ShutdownSignal,
+        system: Arc<str>,
+        max_tokens: u32,
+    ) -> SessionCtx {
+        SessionCtx {
+            bus,
+            journal,
+            backend,
+            sandbox,
+            frontend,
+            registry,
+            shutdown,
+            system,
+            max_tokens,
+            agent_counter: Arc::new(AtomicU64::new(1)),
+            subagent_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SUBAGENTS)),
+            children: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 /// How one conversation ended.
@@ -74,8 +186,12 @@ enum ToolDisposition {
 
 /// Runs the conversation until the model stops calling tools, an LLM error
 /// occurs, a shutdown is requested, or the user interrupts. Tool calls
-/// within one response run sequentially in order; the Agent tool recurses
-/// into this function for the subagent and awaits it inline.
+/// within one response run sequentially in order; the Agent tool spawns a
+/// subagent on a background task and returns at once, and AwaitAgent
+/// collects a finished subagent.
+///
+/// When this loop is about to return, any subagents this agent spawned and
+/// never collected are cancelled, so no child outlives its parent's turn.
 ///
 /// `turn_generation` is the interrupt generation snapshotted when the
 /// top-level turn started; an interrupt applies to this turn when the
@@ -84,7 +200,7 @@ enum ToolDisposition {
 /// conversation keeps no trace of it), and before each tool call (the
 /// remaining tool uses get synthetic interrupted results).
 pub(crate) fn drive<'c>(
-    ctx: &'c SessionCtx<'c>,
+    ctx: &'c SessionCtx,
     agent: AgentId,
     kind: AgentKind,
     messages: &'c mut Vec<Message>,
@@ -92,6 +208,25 @@ pub(crate) fn drive<'c>(
     turn_generation: u64,
 ) -> BoxFuture<'c, Result<TurnOutcome, HarnessError>> {
     Box::pin(async move {
+        let outcome = drive_inner(ctx, &agent, kind, messages, depth, turn_generation).await;
+        // No child may outlive its parent's turn: cancel any this agent
+        // spawned and never collected, however the turn ended.
+        cancel_uncollected_children(ctx, agent.clone()).await;
+        outcome
+    })
+}
+
+/// The conversation loop proper. [`drive`] wraps it to cancel uncollected
+/// children whichever way the loop returns.
+async fn drive_inner(
+    ctx: &SessionCtx,
+    agent: &AgentId,
+    kind: AgentKind,
+    messages: &mut Vec<Message>,
+    depth: u32,
+    turn_generation: u64,
+) -> Result<TurnOutcome, HarnessError> {
+    {
         loop {
             if ctx.shutdown.check().await.is_some() {
                 return Ok(TurnOutcome::ShutdownRequested);
@@ -183,7 +318,7 @@ pub(crate) fn drive<'c>(
                 .collect();
 
             if tool_calls.is_empty() {
-                return Ok(end_of_turn(ctx, &agent, kind, &response));
+                return Ok(end_of_turn(ctx, agent, kind, &response));
             }
 
             let mut result_blocks = Vec::with_capacity(tool_calls.len());
@@ -200,7 +335,7 @@ pub(crate) fn drive<'c>(
                     agent: agent.clone(),
                     call: call.clone(),
                 });
-                match execute_tool(ctx, &agent, call, depth, turn_generation).await? {
+                match execute_tool(ctx, agent, call, depth, turn_generation).await? {
                     ToolDisposition::Output { owner, output } => {
                         ctx.journal.append(JournalEntry::ToolExec {
                             agent: agent.clone(),
@@ -258,14 +393,14 @@ pub(crate) fn drive<'c>(
             });
 
             if response.stop_reason != StopReason::ToolUse {
-                return Ok(end_of_turn(ctx, &agent, kind, &response));
+                return Ok(end_of_turn(ctx, agent, kind, &response));
             }
         }
-    })
+    }
 }
 
 fn end_of_turn(
-    ctx: &SessionCtx<'_>,
+    ctx: &SessionCtx,
     agent: &AgentId,
     kind: AgentKind,
     response: &CompletionResponse,
@@ -287,7 +422,7 @@ fn end_of_turn(
 }
 
 async fn execute_tool(
-    ctx: &SessionCtx<'_>,
+    ctx: &SessionCtx,
     agent: &AgentId,
     call: &ToolCall,
     depth: u32,
@@ -296,7 +431,10 @@ async fn execute_tool(
     match ctx.registry.owner_of(&call.name) {
         Some(ToolOwner::Sandbox) => run_sandbox_tool(ctx, agent, call, turn_generation).await,
         Some(ToolOwner::Frontend) => run_frontend_tool(ctx, agent, call, turn_generation).await,
-        Some(ToolOwner::Harness) => run_agent_tool(ctx, agent, call, depth, turn_generation).await,
+        Some(ToolOwner::Harness) if call.name == "AwaitAgent" => {
+            run_await_agent_tool(ctx, agent, call, turn_generation).await
+        }
+        Some(ToolOwner::Harness) => Ok(run_agent_tool(ctx, agent, call, depth)),
         None => Ok(ToolDisposition::Output {
             owner: "harness",
             output: ToolOutput::error(format!("unknown tool: {}", call.name)),
@@ -311,7 +449,7 @@ async fn execute_tool(
 /// stdout/stderr becomes the tool result and stays in the conversation;
 /// the turn is marked interrupted at the loop's next checkpoint.
 async fn run_sandbox_tool(
-    ctx: &SessionCtx<'_>,
+    ctx: &SessionCtx,
     agent: &AgentId,
     call: &ToolCall,
     turn_generation: u64,
@@ -369,7 +507,7 @@ async fn run_sandbox_tool(
 /// (`Frontend::interrupt`) and then records the resolved output as the tool
 /// result.
 async fn run_frontend_tool(
-    ctx: &SessionCtx<'_>,
+    ctx: &SessionCtx,
     agent: &AgentId,
     call: &ToolCall,
     turn_generation: u64,
@@ -461,40 +599,34 @@ async fn run_frontend_tool(
 }
 
 /// Runs the Agent tool: spawns a subagent conversation seeded with the
-/// prompt and returns its final text as the tool output.
-async fn run_agent_tool(
-    ctx: &SessionCtx<'_>,
+/// prompt on a background task and returns at once with the subagent's id.
+/// The subagent runs until it finishes; AwaitAgent collects it.
+fn run_agent_tool(
+    ctx: &SessionCtx,
     agent: &AgentId,
     call: &ToolCall,
     depth: u32,
-    turn_generation: u64,
-) -> Result<ToolDisposition, HarnessError> {
+) -> ToolDisposition {
     let prompt = match call.input.get("prompt").and_then(|value| value.as_str()) {
         Some(prompt) if !prompt.is_empty() => prompt.to_string(),
         _ => {
-            return Ok(ToolDisposition::Output {
-                owner: "harness",
-                output: ToolOutput::error("Agent requires a non-empty 'prompt' string"),
-            })
+            return harness_error("Agent requires a non-empty 'prompt' string");
         }
     };
     if depth >= MAX_SUBAGENT_DEPTH {
-        return Ok(ToolDisposition::Output {
-            owner: "harness",
-            output: ToolOutput::error(format!(
-                "subagent depth limit ({MAX_SUBAGENT_DEPTH}) reached"
-            )),
-        });
+        return harness_error(format!(
+            "subagent depth limit ({MAX_SUBAGENT_DEPTH}) reached"
+        ));
     }
-    let permit = match ctx.subagent_slots.try_acquire() {
+    // One session-wide pool of live children: an owned permit moves into the
+    // child handle and returns the slot when the child is collected or
+    // cancelled.
+    let permit = match ctx.subagent_slots.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            return Ok(ToolDisposition::Output {
-                owner: "harness",
-                output: ToolOutput::error(format!(
-                    "subagent concurrency limit ({MAX_CONCURRENT_SUBAGENTS}) reached"
-                )),
-            })
+            return harness_error(format!(
+                "subagent concurrency limit ({MAX_CONCURRENT_SUBAGENTS}) reached"
+            ));
         }
     };
     let name = call
@@ -507,69 +639,379 @@ async fn run_agent_tool(
     ctx.bus.emit(EventPayload::AgentSpawned {
         parent: agent.clone(),
         agent: sub_id.clone(),
-        name,
+        name: name.clone(),
         prompt: prompt.clone(),
     });
-    let mut sub_messages = vec![Message::user_text(prompt)];
-    let outcome = drive(
-        ctx,
-        sub_id.clone(),
-        AgentKind::Subagent,
-        &mut sub_messages,
-        depth + 1,
-        turn_generation,
-    )
-    .await?;
-    drop(permit);
+
+    // The child's turn generation is the current one, so an interrupt or
+    // shutdown requested after the spawn unblocks the child's own `drive`
+    // checks.
+    let turn_generation = ctx.shutdown.interrupt_generation();
+    let emitted = Arc::new(AtomicBool::new(false));
+    let done_tx = {
+        let mut registry = ctx.children.lock().expect("child registry poisoned");
+        registry
+            .entry(agent.clone())
+            .or_insert_with(ChildPool::new)
+            .done_tx
+            .clone()
+    };
+    let task_ctx = ctx.clone();
+    let task_id = sub_id.clone();
+    let task_emitted = emitted.clone();
+    let join = tokio::spawn(async move {
+        let mut sub_messages = vec![Message::user_text(prompt)];
+        let outcome = drive(
+            &task_ctx,
+            task_id.clone(),
+            AgentKind::Subagent,
+            &mut sub_messages,
+            depth + 1,
+            turn_generation,
+        )
+        .await;
+        let result = child_result_of(outcome);
+        // Whoever wins the swap emits the terminal AgentCompleted; if the
+        // parent cancelled this child first it has already emitted, so we
+        // skip.
+        if !task_emitted.swap(true, Ordering::SeqCst) {
+            task_ctx.bus.emit(EventPayload::AgentCompleted {
+                agent: task_id.clone(),
+                result: result.output.clone(),
+                is_error: result.is_error,
+            });
+        }
+        let _ = done_tx.send(task_id);
+        result
+    });
+
+    {
+        let mut registry = ctx.children.lock().expect("child registry poisoned");
+        let pool = registry.entry(agent.clone()).or_insert_with(ChildPool::new);
+        pool.children.insert(
+            sub_id.clone(),
+            ChildHandle {
+                name: name.clone(),
+                join,
+                _permit: permit,
+                emitted,
+            },
+        );
+    }
+
+    let label = name.as_deref().unwrap_or(&sub_id);
+    harness_ok(format!(
+        "Started subagent '{label}' ({sub_id}). It runs in the background; \
+         collect it with AwaitAgent. Pass agent {sub_id:?} to wait for this one."
+    ))
+}
+
+/// Maps a finished subagent's turn outcome (or a harness error from its
+/// task) into the [`ChildResult`] the collecting AwaitAgent formats.
+fn child_result_of(outcome: Result<TurnOutcome, HarnessError>) -> ChildResult {
     match outcome {
-        TurnOutcome::Completed { final_text } => {
-            ctx.bus.emit(EventPayload::AgentCompleted {
-                agent: sub_id,
-                result: final_text.clone(),
-                is_error: false,
-            });
-            Ok(ToolDisposition::Output {
-                owner: "harness",
-                output: ToolOutput::ok(final_text),
-            })
+        Ok(TurnOutcome::Completed { final_text }) => ChildResult {
+            output: final_text,
+            is_error: false,
+            shutdown: false,
+            script_failure: None,
+        },
+        Ok(TurnOutcome::LlmFailed(message)) => ChildResult {
+            output: message,
+            is_error: true,
+            shutdown: false,
+            script_failure: None,
+        },
+        Ok(TurnOutcome::ScriptFailed(message)) => ChildResult {
+            output: message.clone(),
+            is_error: true,
+            shutdown: false,
+            script_failure: Some(message),
+        },
+        Ok(TurnOutcome::Interrupted) => ChildResult {
+            output: "interrupted by the user".into(),
+            is_error: true,
+            shutdown: false,
+            script_failure: None,
+        },
+        Ok(TurnOutcome::ShutdownRequested) => ChildResult {
+            output: "session shutdown requested".into(),
+            is_error: true,
+            shutdown: true,
+            script_failure: None,
+        },
+        Err(error) => ChildResult {
+            output: error.to_string(),
+            is_error: true,
+            shutdown: false,
+            script_failure: None,
+        },
+    }
+}
+
+/// Runs the AwaitAgent tool: blocks until one of the calling agent's
+/// subagents finishes (a specific one when `agent` is given, otherwise the
+/// first to finish), then returns its report. Selects against the abort
+/// signal so an interrupt or shutdown unblocks the wait.
+async fn run_await_agent_tool(
+    ctx: &SessionCtx,
+    agent: &AgentId,
+    call: &ToolCall,
+    turn_generation: u64,
+) -> Result<ToolDisposition, HarnessError> {
+    let requested = call
+        .input
+        .get("agent")
+        .and_then(|value| value.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+
+    // Resolve which child to collect, draining the completion channel for
+    // the await-any case. Returns the child id, or an error tool result.
+    let child_id = match requested {
+        Some(id) => {
+            let known = {
+                let registry = ctx.children.lock().expect("child registry poisoned");
+                registry
+                    .get(agent)
+                    .is_some_and(|pool| pool.children.contains_key(&id))
+            };
+            if !known {
+                return Ok(harness_error(format!(
+                    "AwaitAgent: {id:?} is not an outstanding subagent of this agent"
+                )));
+            }
+            id
         }
-        TurnOutcome::LlmFailed(message) => {
-            ctx.bus.emit(EventPayload::AgentCompleted {
-                agent: sub_id,
-                result: message.clone(),
-                is_error: true,
-            });
-            Ok(ToolDisposition::Output {
-                owner: "harness",
-                output: ToolOutput::error(message),
-            })
+        None => {
+            let has_children = {
+                let registry = ctx.children.lock().expect("child registry poisoned");
+                registry
+                    .get(agent)
+                    .is_some_and(|pool| !pool.children.is_empty())
+            };
+            if !has_children {
+                return Ok(harness_error("AwaitAgent: no subagents are running"));
+            }
+            // Wait for the first child to signal completion. The wait races
+            // against the abort signal.
+            match await_any_child(ctx, agent, turn_generation).await {
+                AwaitAny::Child(id) => id,
+                AwaitAny::Shutdown => return Ok(ToolDisposition::Shutdown),
+                AwaitAny::Interrupted => return Ok(ToolDisposition::Interrupted),
+            }
         }
-        TurnOutcome::ScriptFailed(message) => {
-            ctx.bus.emit(EventPayload::AgentCompleted {
-                agent: sub_id,
-                result: message.clone(),
-                is_error: true,
+    };
+
+    // Collect the chosen child: for a specific id we still race the join
+    // against the abort signal so an interrupt or shutdown unblocks us.
+    let handle = {
+        let mut registry = ctx.children.lock().expect("child registry poisoned");
+        registry
+            .get_mut(agent)
+            .and_then(|pool| pool.children.remove(&child_id))
+    };
+    let Some(handle) = handle else {
+        return Ok(harness_error(format!(
+            "AwaitAgent: {child_id:?} was already collected"
+        )));
+    };
+    let ChildHandle {
+        name,
+        mut join,
+        _permit,
+        emitted,
+    } = handle;
+    // Dropping the permit (after the join) returns the slot.
+    let result = tokio::select! {
+        biased;
+        abort = ctx.shutdown.wait_abort(turn_generation) => {
+            // Re-park the handle so the turn-end cancellation reaps it.
+            reinsert_child(
+                ctx,
+                agent,
+                child_id.clone(),
+                ChildHandle {
+                    name: name.clone(),
+                    join,
+                    _permit,
+                    emitted,
+                },
+            );
+            return Ok(match abort {
+                AbortReason::Shutdown(_) => ToolDisposition::Shutdown,
+                AbortReason::Interrupted => ToolDisposition::Interrupted,
             });
-            Ok(ToolDisposition::ScriptFailed(message))
         }
-        TurnOutcome::Interrupted => {
-            // The parent loop records the synthetic interrupted result for
-            // this Agent tool use and unwinds.
-            ctx.bus.emit(EventPayload::AgentCompleted {
-                agent: sub_id,
-                result: "interrupted by the user".into(),
-                is_error: true,
+        joined = &mut join => {
+            drop(_permit);
+            joined
+        }
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(join_error) => {
+            return Ok(harness_error(format!(
+                "AwaitAgent: subagent {child_id} task failed: {join_error}"
+            )));
+        }
+    };
+
+    if result.shutdown {
+        return Ok(ToolDisposition::Shutdown);
+    }
+    if let Some(detail) = result.script_failure {
+        return Ok(ToolDisposition::ScriptFailed(detail));
+    }
+    let label = name.as_deref().unwrap_or(&child_id);
+    let heading = format!("Subagent '{label}' ({child_id}) finished.\n");
+    let body = format!("{heading}{}", result.output);
+    Ok(ToolDisposition::Output {
+        owner: "harness",
+        output: ToolOutput {
+            content: body,
+            is_error: result.is_error,
+        },
+    })
+}
+
+/// Outcome of waiting for the first of an agent's children to finish.
+enum AwaitAny {
+    Child(AgentId),
+    Shutdown,
+    Interrupted,
+}
+
+/// Waits for the first of `agent`'s children to signal completion on the
+/// pool's done channel, racing the abort signal. The done receiver lives in
+/// the registry; it is taken out for the wait and replaced afterwards so a
+/// concurrent await on the same agent (not expected, agents are
+/// single-threaded loops) does not lose it.
+async fn await_any_child(ctx: &SessionCtx, agent: &AgentId, turn_generation: u64) -> AwaitAny {
+    loop {
+        // Drain any already-finished children first.
+        if let Some(id) = take_finished_child(ctx, agent) {
+            return AwaitAny::Child(id);
+        }
+        let mut done_rx = {
+            let mut registry = ctx.children.lock().expect("child registry poisoned");
+            match registry.get_mut(agent) {
+                Some(pool) => pool.done_rx_take(),
+                None => return AwaitAny::Interrupted,
+            }
+        };
+        let signalled = tokio::select! {
+            biased;
+            abort = ctx.shutdown.wait_abort(turn_generation) => {
+                put_done_rx(ctx, agent, done_rx);
+                return match abort {
+                    AbortReason::Shutdown(_) => AwaitAny::Shutdown,
+                    AbortReason::Interrupted => AwaitAny::Interrupted,
+                };
+            }
+            received = done_rx.recv() => received,
+        };
+        put_done_rx(ctx, agent, done_rx);
+        match signalled {
+            Some(id) => {
+                // The signalled child may already have been collected by a
+                // specific-id await; only return it if it is still parked.
+                let still_outstanding = {
+                    let registry = ctx.children.lock().expect("child registry poisoned");
+                    registry
+                        .get(agent)
+                        .is_some_and(|pool| pool.children.contains_key(&id))
+                };
+                if still_outstanding {
+                    return AwaitAny::Child(id);
+                }
+            }
+            None => return AwaitAny::Interrupted,
+        }
+    }
+}
+
+/// Returns the id of one of `agent`'s children whose task has already
+/// finished, if any.
+fn take_finished_child(ctx: &SessionCtx, agent: &AgentId) -> Option<AgentId> {
+    let registry = ctx.children.lock().expect("child registry poisoned");
+    registry.get(agent).and_then(|pool| {
+        pool.children
+            .iter()
+            .find(|(_, handle)| handle.join.is_finished())
+            .map(|(id, _)| id.clone())
+    })
+}
+
+fn put_done_rx(ctx: &SessionCtx, agent: &AgentId, rx: mpsc::UnboundedReceiver<AgentId>) {
+    let mut registry = ctx.children.lock().expect("child registry poisoned");
+    if let Some(pool) = registry.get_mut(agent) {
+        pool.done_rx_put(rx);
+    }
+}
+
+fn reinsert_child(ctx: &SessionCtx, agent: &AgentId, id: AgentId, handle: ChildHandle) {
+    let mut registry = ctx.children.lock().expect("child registry poisoned");
+    registry
+        .entry(agent.clone())
+        .or_insert_with(ChildPool::new)
+        .children
+        .insert(id, handle);
+}
+
+/// Cancels every subagent the agent spawned and never collected, and every
+/// descendant of those. Called as the agent's `drive` returns, so no child
+/// outlives its parent's turn. Each cancelled task is aborted and then
+/// joined, so by the time this returns no background task is still running
+/// (and no task still holds its clone of the session context). The walk is
+/// over the registry directly rather than relying on an aborted task to run
+/// its own cleanup, so a grandchild is never orphaned.
+fn cancel_uncollected_children(ctx: &SessionCtx, agent: AgentId) -> BoxFuture<'_, ()> {
+    Box::pin(async move {
+        let pool = {
+            let mut registry = ctx.children.lock().expect("child registry poisoned");
+            registry.remove(&agent)
+        };
+        let Some(pool) = pool else {
+            return;
+        };
+        let mut cancelled = 0;
+        for (id, handle) in pool.children {
+            handle.join.abort();
+            // Cancel this child's own descendants before joining it.
+            cancel_uncollected_children(ctx, id.clone()).await;
+            let _ = handle.join.await;
+            // Emit the terminal AgentCompleted only if the child's own task
+            // did not already emit it.
+            if !handle.emitted.swap(true, Ordering::SeqCst) {
+                ctx.bus.emit(EventPayload::AgentCompleted {
+                    agent: id,
+                    result: "cancelled (parent ended turn without collecting)".into(),
+                    is_error: true,
+                });
+                cancelled += 1;
+            }
+            drop(handle._permit);
+        }
+        if cancelled > 0 {
+            ctx.journal.append(JournalEntry::Lifecycle {
+                message: format!("{agent}: cancelled {cancelled} uncollected subagent(s)"),
             });
-            Ok(ToolDisposition::Interrupted)
         }
-        TurnOutcome::ShutdownRequested => {
-            ctx.bus.emit(EventPayload::AgentCompleted {
-                agent: sub_id,
-                result: "session shutdown requested".into(),
-                is_error: true,
-            });
-            Ok(ToolDisposition::Shutdown)
-        }
+    })
+}
+
+fn harness_ok(message: impl Into<String>) -> ToolDisposition {
+    ToolDisposition::Output {
+        owner: "harness",
+        output: ToolOutput::ok(message),
+    }
+}
+
+fn harness_error(message: impl Into<String>) -> ToolDisposition {
+    ToolDisposition::Output {
+        owner: "harness",
+        output: ToolOutput::error(message),
     }
 }
 
@@ -614,7 +1056,7 @@ fn push_user_prompt(messages: &mut Vec<Message>, text: String) {
 /// The top-level loop: emits AwaitingInput, waits for the next user input
 /// (or a shutdown request), runs the turn, and repeats. Returns how the
 /// session ended, with the final shutdown message.
-pub(crate) async fn top_level_loop(ctx: &SessionCtx<'_>) -> Result<SessionEnd, HarnessError> {
+pub(crate) async fn top_level_loop(ctx: &SessionCtx) -> Result<SessionEnd, HarnessError> {
     let agent = silo_core::conversation::top_level_agent_id();
     let mut messages: Vec<Message> = Vec::new();
     // The headless frontend answers every input request immediately, so a
